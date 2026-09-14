@@ -29,7 +29,8 @@
  */
 #define HR_PIN_LCD_BL     38
 
-#define HR_LCD_WIDTH      160 /* landscape, USB plug on the left */
+#define HR_LCD_WIDTH      160 /* landscape; plug left, or right with
+                                 CONFIG_HR_DISPLAY_ROTATE_180 */
 #define HR_LCD_HEIGHT     80
 /*
  * Vendor examples clock the panel at 40 MHz. The ST7735S datasheet's minimum
