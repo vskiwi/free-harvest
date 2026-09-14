@@ -49,13 +49,16 @@ config HR_BUTTON
         anything to the dryer - a stray press on a stick protruding from the
         machine must not be able to start or stop a batch.
 
-config HR_UI_ROTATION_180
-    bool "Rotate the display 180 degrees"
+config HR_DISPLAY_ROTATE_180
+    bool "Rotate the display 180 degrees (USB plug on the right)"
     depends on HR_DISPLAY
-    default n
+    default y
     help
-        The default orientation reads correctly with the USB plug on the
-        left. Enable this if the dryer's port puts the stick in upside down.
+        USB port of the Harvest Right dryer is on the right side; rotate so
+        the screen reads upright when plugged in. Disable this for a port
+        on the left (the vendor sketch's orientation). Only the panel's
+        MADCTL changes; the frame buffer, fonts, button and LED are
+        unaffected.
 
 config HR_AP_SSID
     string "Setup access-point SSID"

@@ -48,3 +48,6 @@ CONFIG_HR_BOARD_T_DONGLE_S3=y
 CONFIG_HR_DISPLAY=y
 CONFIG_HR_LED=y
 CONFIG_HR_BUTTON=y
+# The dryer's USB port is on its right side, so the stick hangs plug-right:
+# rotate 180 degrees from the vendor's plug-left orientation.
+CONFIG_HR_DISPLAY_ROTATE_180=y

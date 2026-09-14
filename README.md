@@ -236,10 +236,12 @@ port is the dryer-facing device. Use **Settings → Debug & advanced → Device
 log** in the web UI (`/api/log`), or UART0 at 115200 baud on the 4-pin JST-SH "QWIIC" connector
 (GPIO43 TX / GPIO44 RX, 2023+ board revision only).
 
-**Orientation.** The default reads correctly with the USB plug on the left. If
-your dryer's port puts the stick in upside down, enable
-**Free Harvest Adapter → Rotate the display 180 degrees**
-(`CONFIG_HR_UI_ROTATION_180`) in `idf.py -B build-tdongle menuconfig`.
+**Orientation.** The Harvest Right's USB port is on the machine's right side,
+so the stick hangs with its plug on the right and the build rotates the
+screen 180° to read upright there (`CONFIG_HR_DISPLAY_ROTATE_180=y`, the
+default for this board). If your port is on the left, disable
+**Free Harvest Adapter → Rotate the display 180 degrees** in
+`idf.py -B build-tdongle menuconfig`.
 
 **Notes.** The plain T-Dongle-S3 has no PSRAM; the frame buffer (25.6 KB) lives
 in internal RAM. The microSD slot is not used. Pin assignments are in
