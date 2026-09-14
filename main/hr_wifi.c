@@ -39,6 +39,7 @@ static char s_ssid[33];
 static esp_timer_handle_t s_ap_timeout_timer;
 static esp_timer_handle_t s_sta_retry_timer;
 static bool s_ap_window_expired; /* true once the 5-min window has closed */
+static int64_t s_ap_opened_us;   /* when the current window was armed */
 
 static wifi_ap_record_t s_scan[MAX_SCAN];
 static uint16_t s_scan_count;
@@ -110,6 +111,7 @@ static void arm_ap_timeout(void)
     }
     esp_timer_stop(s_ap_timeout_timer); /* restart the window cleanly */
     esp_timer_start_once(s_ap_timeout_timer, AP_OPEN_WINDOW_US);
+    s_ap_opened_us = esp_timer_get_time();
 }
 
 static void cancel_ap_timeout(void)
@@ -512,6 +514,32 @@ int hr_wifi_rssi_pct(void)
         pct = 100;
     }
     return pct;
+}
+
+int hr_wifi_rssi_dbm(void)
+{
+    wifi_ap_record_t ap;
+    if (s_status != HR_WIFI_CONNECTED ||
+        esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        return 0;
+    }
+    return ap.rssi;
+}
+
+long hr_wifi_ap_remaining_s(void)
+{
+    if (s_status != HR_WIFI_AP_SETUP || s_ap_window_expired ||
+        s_ap_opened_us == 0) {
+        return 0;
+    }
+    int64_t left_us = (int64_t)AP_OPEN_WINDOW_US -
+                      (esp_timer_get_time() - s_ap_opened_us);
+    return left_us > 0 ? (long)(left_us / 1000000) : 0;
+}
+
+bool hr_wifi_ap_window_expired(void)
+{
+    return s_ap_window_expired;
 }
 
 void hr_wifi_current_ssid(char *out, size_t cap)

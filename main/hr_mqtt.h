@@ -42,6 +42,9 @@ bool hr_mqtt_connected(void);
 bool hr_mqtt_set_broker(const char *host, int port, const char *user,
                         const char *pass);
 
+/* True once a broker host has been stored (connected or not). */
+bool hr_mqtt_configured(void);
+
 /* Fill JSON status for the web UI: {"configured":..,"connected":..,"host":..}*/
 size_t hr_mqtt_status_json(char *out, size_t cap);
 
