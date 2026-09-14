@@ -52,6 +52,7 @@ Stop by our discord and say hey: https://discord.gg/KphHBYh9KC
 - [What it does](#what-it-does)
 - [Remote control, and its limits](#remote-control-and-its-limits)
 - [Hardware](#hardware)
+- [LilyGo T-Dongle-S3](#lilygo-t-dongle-s3)
 - [Install the firmware](#install-the-firmware)
 - [First-time setup](#first-time-setup)
 - [Normal operation](#normal-operation)
@@ -179,6 +180,70 @@ shut the drain valve by hand.
 > The DevKitC-1 has **two** USB-C sockets:
 > - **`USB`** — native USB. **This one goes to the freeze dryer.**
 > - **`UART`** — flashing/console bridge. Use this for the first flash only.
+
+---
+
+## LilyGo T-Dongle-S3
+
+The [T-Dongle-S3](https://github.com/Xinyuan-LilyGO/T-Dongle-S3) is an ESP32-S3
+in a USB-A stick with a 0.96" colour LCD (80×160), one RGB LED and one button.
+It plugs straight into the dryer's USB port with no cable, and the screen means
+you can see what the dryer is doing without opening the app. Everything else —
+the web UI, MQTT, the logbook, the flash capture — is identical to the DevKitC
+build; the board only adds outputs.
+
+**What the screen shows.** A status bar (Wi-Fi, MQTT, dryer link, clock) and one
+of: the setup-network name and `http://192.168.4.1` while provisioning; the IP
+address for ten seconds after joining your Wi-Fi; *no dryer* with the reason
+(USB not enumerated / no frames) when the stick is powered but not talking;
+**IDLE** with the shelf temperature; **RUN** with the phase, phase time,
+temperature, vacuum, progress bar, batch time and ETA; **COMPLETE**; and an
+**ALERT** screen (link lost mid-run, bad frames, capture dropping) that the
+button dismisses. The LED mirrors the phase colour — blue freezing, orange
+drying, red-orange final dry, green complete — blinking or breathing when
+something wants attention, and brightens briefly on every frame from the dryer.
+
+**The button never controls the dryer.** A short press dismisses an alert, or
+cycles the main screen → an *info* page (IP, SSID and signal, MQTT, capture use,
+heap, uptime) → the last raw STAT frame → back. A long press (1.5 s) turns the
+backlight and LED off and on again. There is no code path from the button to
+the USB link; a stray press on a stick protruding from the machine cannot start
+or stop a batch.
+
+**Build.** The board is a Kconfig choice layered on the normal defaults. Use a
+separate build directory *and* a separate sdkconfig, so the generic build is
+untouched:
+
+```bash
+idf.py -B build-tdongle -D SDKCONFIG=build-tdongle/sdkconfig \
+    -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.t-dongle-s3" \
+    set-target esp32s3 build
+```
+
+**First flash.** The stick has one USB port and the ESP32-S3 has one USB PHY.
+While the app runs, that PHY is the CDC device the dryer talks to. The ROM
+bootloader, however, still speaks USB-Serial/JTAG, so: **hold the BOOT button
+while plugging the stick into your computer**, then
+
+```bash
+idf.py -B build-tdongle -p /dev/cu.usbmodem* flash
+```
+
+Every update after that goes over Wi-Fi — see [Updating (OTA)](#updating-ota).
+
+**Logs.** `idf.py monitor` does not work once the app is running: the only USB
+port is the dryer-facing device. Use **Settings → Debug & advanced → Device
+log** in the web UI (`/api/log`), or UART0 at 115200 baud on the 4-pin JST-SH "QWIIC" connector
+(GPIO43 TX / GPIO44 RX, 2023+ board revision only).
+
+**Orientation.** The default reads correctly with the USB plug on the left. If
+your dryer's port puts the stick in upside down, enable
+**Free Harvest Adapter → Rotate the display 180 degrees**
+(`CONFIG_HR_UI_ROTATION_180`) in `idf.py -B build-tdongle menuconfig`.
+
+**Notes.** The plain T-Dongle-S3 has no PSRAM; the frame buffer (25.6 KB) lives
+in internal RAM. The microSD slot is not used. Pin assignments are in
+`main/board_t_dongle_s3.h`.
 
 ---
 
@@ -495,6 +560,9 @@ components/hr_protocol/     portable core (no ESP-IDF deps, fully testable)
   hr_history.[ch]             frame ring buffer, per-verb table, field diffing
   hr_telemetry.[ch]           STAT decoding, cycle-phase detection
   hr_trend.[ch]               30s series + temperature-adaptive smoothing
+components/hr_ui/           T-Dongle-S3 screen model (portable, host-tested):
+                              which screen, alerts, LED colour, formatting
+components/esp_lcd_st7735_lilygo/  ST7735 esp_lcd panel driver (from LilyGo, MIT)
 main/                       ESP-IDF layer
   main.c                      wiring
   hr_usb.[ch]                 TinyUSB CDC-ACM device (the dryer is USB host)
@@ -503,6 +571,9 @@ main/                       ESP-IDF layer
   hr_mqtt.[ch]                MQTT client + Home Assistant discovery
   hr_log.[ch]                 in-app log capture
   hr_capture.[ch]             persistent flash log of every frame
+  hr_display*.[ch] hr_gfx     T-Dongle-S3 only: hr_ui task, screens, panel, framebuffer
+  hr_led.[ch] hr_button.[ch]  T-Dongle-S3 only: APA102 LED, BOOT button
+  board_t_dongle_s3.h         T-Dongle-S3 pin map
   www/index.html              the web app (single file, embedded in firmware)
 test/                       host unit tests
 tools/
