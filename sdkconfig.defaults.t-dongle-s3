@@ -1,8 +1,12 @@
 # LilyGo T-Dongle-S3 - overlay applied on top of sdkconfig.defaults.
 #
-#   idf.py -B build-tdongle \
+#   idf.py -B build-tdongle -D SDKCONFIG=build-tdongle/sdkconfig \
 #       -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.t-dongle-s3" \
 #       set-target esp32s3 build
+#
+# (-D SDKCONFIG keeps this board's generated sdkconfig inside its build
+# directory; without it, idf.py writes ./sdkconfig and the next generic
+# build in ./build silently picks up the dongle configuration.)
 #
 # Board: bare ESP32-S3 with 16 MB Quad-SPI flash (W25Q128), NO PSRAM, an
 # 80x160 ST7735 LCD, one APA102 RGB LED and one button, all inside a USB-A
