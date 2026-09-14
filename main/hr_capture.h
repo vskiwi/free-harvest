@@ -6,8 +6,25 @@
  * inbound frame to a file in a dedicated SPIFFS partition so a whole cycle can
  * be downloaded afterwards - and survives reboots and power cuts.
  *
- * Format: one line per frame, "<millis>\t<frame body>\n" - the same shape the
- * existing /api/capture download produces, so tooling keeps working.
+ * Format v2: one line per event, four tab-separated columns:
+ *
+ *     <millis>\t<epoch|->\t<dir>\t<payload>
+ *
+ *   millis   milliseconds since boot (esp_timer)
+ *   epoch    Unix seconds when the browser has set the clock, else "-"
+ *   dir      >  frame from the dryer            <  frame we sent
+ *            !  adapter event (usb/link/boot)   ?  bytes the parser rejected
+ *            ~  run summary ("repeat <body> xN first..last")
+ *            e  complete encoded frame (6.0.644170 ")S" transport):
+ *               "enc <len> <frame verbatim, header included>"
+ *   payload  the frame without its CR; events as short text; rejected bytes
+ *            printable as-is and otherwise \xNN, continued on further '?'
+ *            lines ("<why> <n> +<offset>: ...") when longer than one line
+ *
+ * The file begins (after every mount) with "# hr-capture v2 ..." naming the
+ * firmware and the columns. Format v1 was "<millis>\t<body>" and recorded
+ * only the inbound side; both directions plus USB events are what make a
+ * capture usable for decoding the protocol.
  */
 #ifndef HR_CAPTURE_H
 #define HR_CAPTURE_H
@@ -56,15 +73,39 @@ bool hr_capture_ready(void);
  */
 void hr_capture_append(uint32_t t_ms, const char *body);
 
+/* Direction markers for hr_capture_append_dir(). */
+#define HR_CAP_DIR_RX    '>'
+#define HR_CAP_DIR_TX    '<'
+#define HR_CAP_DIR_EVENT '!'
+#define HR_CAP_DIR_BAD   '?'
+#define HR_CAP_DIR_ENC   'e'   /* complete encoded frame, see hr_capture_enc() */
+
+/* As hr_capture_append(), with an explicit direction column. Same rules:
+ * non-blocking, safe from the USB task, dropped and counted when full. */
+void hr_capture_append_dir(uint32_t t_ms, char dir, const char *body);
+
+/* Record an adapter event ("usb mount #2", "link down", ...) with the
+ * current uptime. printf-style; the result is capped to one line. */
+void hr_capture_event(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/*
+ * Record bytes the frame parser rejected: printable ASCII as-is, anything
+ * else as \xNN. ALL `n` bytes are recorded; when they outgrow one line the
+ * record continues on further '?' lines with the same timestamp, whose body
+ * starts "<why> <n> +<offset>: " - see hr_capture.c.
+ */
+void hr_capture_rejected(uint32_t t_ms, const char *bytes, size_t n,
+                         const char *why);
+
 /*
  * Record one complete ENCODED frame (the 6.0.644170 transport, see
- * hr_protocol.h) verbatim, header included:
+ * hr_protocol.h) verbatim, header included, in its own direction column:
  *
- *     <millis>\t~enc <len> )S$3...
+ *     <millis>\t<epoch>\te\tenc <len> )S$3...
  *
- * The "~" prefix is the log's existing marker for a line that is not a
- * plaintext frame ("~repeat", "~boot"), so tooling that splits frame bodies
- * on commas skips it. Same queue and rules as hr_capture_append().
+ * Not '>' (it has no verb to split) and not '?' (it is a whole frame, not
+ * debris). No escaping: the alphabet is printable. Same queue and rules as
+ * hr_capture_append().
  */
 void hr_capture_enc(uint32_t t_ms, const char *frame, size_t len);
 

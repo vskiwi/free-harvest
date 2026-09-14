@@ -1,6 +1,9 @@
 #include "hr_capture.h"
+#include "hr_batchstore.h" /* hr_time_now */
+#include "hr_http.h"       /* FREEHARVEST_VERSION */
 #include "hr_quiesce.h"
 
+#include "esp_mac.h"
 #include "esp_timer.h"
 
 #include "esp_log.h"
@@ -13,6 +16,7 @@
 #include "freertos/task.h"
 
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -157,6 +161,8 @@ typedef struct __attribute__((packed)) {
 
 typedef struct {
     uint32_t t_ms;
+    uint32_t epoch;   /* 0 = unknown */
+    char dir;         /* HR_CAP_DIR_* */
     char body[HR_CAPTURE_LINE_MAX];
 } write_msg_t;
 
@@ -259,19 +265,43 @@ static void seg_load(void)
  * Write one line to the active segment. Caller holds the lock and has already
  * rotated if needed.
  */
-static void emit(uint32_t t_ms, const char *body)
+static void emit(uint32_t t_ms, uint32_t epoch, char dir, const char *body)
 {
     FILE *f = fopen(k_seg[s_seg], "a");
     if (f == NULL) {
         return;
     }
-    int n = fprintf(f, "%" PRIu32 "\t%s\n", t_ms, body);
+    int n;
+    if (epoch != 0) {
+        n = fprintf(f, "%" PRIu32 "\t%" PRIu32 "\t%c\t%s\n", t_ms, epoch, dir,
+                    body);
+    } else {
+        n = fprintf(f, "%" PRIu32 "\t-\t%c\t%s\n", t_ms, dir, body);
+    }
     fclose(f);
     if (n > 0) {
         s_used += (size_t)n;
         s_seg_used += (size_t)n;
     }
 }
+
+/* A line that is not an event: the "# hr-capture v2" header. */
+static void emit_raw(const char *line)
+{
+    FILE *f = fopen(k_seg[s_seg], "a");
+    if (f == NULL) {
+        return;
+    }
+    int n = fprintf(f, "%s\n", line);
+    fclose(f);
+    if (n > 0) {
+        s_used += (size_t)n;
+        s_seg_used += (size_t)n;
+    }
+}
+
+static char     s_run_dir;
+static uint32_t s_run_epoch;
 
 /* Emit the pending run summary, if any. Caller holds the lock. */
 static void flush_run(void)
@@ -280,10 +310,25 @@ static void flush_run(void)
         return;
     }
     char line[HR_CAPTURE_LINE_MAX + 64];
-    snprintf(line, sizeof(line), "~repeat %s x%" PRIu32 " %" PRIu32 "..%" PRIu32,
-             s_run_body, s_run_count, s_run_first_ms, s_run_last_ms);
-    emit(s_run_last_ms, line);
+    snprintf(line, sizeof(line), "repeat %c %s x%" PRIu32 " %" PRIu32 "..%" PRIu32,
+             s_run_dir, s_run_body, s_run_count, s_run_first_ms, s_run_last_ms);
+    emit(s_run_last_ms, s_run_epoch, '~', line);
     s_run_count = 0;
+}
+
+/*
+ * Only frames take part in run collapsing, and only when the build allows it:
+ * CONFIG_HR_CAPTURE_RAW keeps every line verbatim for protocol work. Events
+ * and rejected bytes are always written as they are.
+ */
+static bool collapsible(const write_msg_t *m)
+{
+#if CONFIG_HR_CAPTURE_RAW
+    (void)m;
+    return false;
+#else
+    return m->dir == HR_CAP_DIR_RX || m->dir == HR_CAP_DIR_TX;
+#endif
 }
 
 /* Runs on the worker task: the only place that touches the filesystem. */
@@ -322,7 +367,9 @@ static void write_line_now(const write_msg_t *m)
      * is still flushed every RUN_MAX_MS so a long idle stretch is never
      * entirely absent from the log.
      */
-    if (s_run_count > 0 && strcmp(m->body, s_run_body) == 0) {
+    bool same = collapsible(m) && m->dir == s_run_dir &&
+                strcmp(m->body, s_run_body) == 0;
+    if (s_run_count > 0 && same) {
         s_run_count++;
         s_run_last_ms = m->t_ms;
         s_suppressed++;
@@ -331,23 +378,29 @@ static void write_line_now(const write_msg_t *m)
             snprintf(s_run_body, sizeof(s_run_body), "%s", m->body);
             s_run_first_ms = m->t_ms;
             s_run_last_ms = m->t_ms;
+            s_run_epoch = m->epoch;
         }
         xSemaphoreGive(s_lock);
         return;
     }
-    if (s_run_count == 0 && s_run_body[0] != '\0' &&
-        strcmp(m->body, s_run_body) == 0) {
+    if (s_run_count == 0 && s_run_body[0] != '\0' && same) {
         /* second sighting - start a run rather than writing the duplicate */
         s_run_count = 1;
         s_run_first_ms = s_run_last_ms = m->t_ms;
+        s_run_epoch = m->epoch;
         s_suppressed++;
         xSemaphoreGive(s_lock);
         return;
     }
 
     flush_run();
-    emit(m->t_ms, m->body);
-    snprintf(s_run_body, sizeof(s_run_body), "%s", m->body);
+    emit(m->t_ms, m->epoch, m->dir, m->body);
+    if (collapsible(m)) {
+        snprintf(s_run_body, sizeof(s_run_body), "%s", m->body);
+        s_run_dir = m->dir;
+    } else {
+        s_run_body[0] = '\0'; /* an event breaks a run, as a new frame would */
+    }
     xSemaphoreGive(s_lock);
 }
 
@@ -362,18 +415,98 @@ static void writer_task(void *arg)
     }
 }
 
-void hr_capture_append(uint32_t t_ms, const char *body)
+void hr_capture_append_dir(uint32_t t_ms, char dir, const char *body)
 {
     if (s_q == NULL || body == NULL || body[0] == '\0') {
         return;
     }
     write_msg_t m;
     m.t_ms = t_ms;
+    m.epoch = hr_time_now();
+    m.dir = dir;
     snprintf(m.body, sizeof(m.body), "%s", body);
+    /* Frames never carry a tab or a newline; make sure nothing else does
+     * either, or the column structure of the file is gone. */
+    for (char *p = m.body; *p; p++) {
+        if (*p == '\t' || *p == '\r' || *p == '\n') {
+            *p = ' ';
+        }
+    }
     /* Zero timeout: never block the caller, which may be the USB RX task. */
     if (xQueueSend(s_q, &m, 0) != pdTRUE) {
         s_dropped++;
     }
+}
+
+void hr_capture_append(uint32_t t_ms, const char *body)
+{
+    hr_capture_append_dir(t_ms, HR_CAP_DIR_RX, body);
+}
+
+void hr_capture_event(const char *fmt, ...)
+{
+    char line[160];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (n <= 0) {
+        return;
+    }
+    hr_capture_append_dir((uint32_t)(esp_timer_get_time() / 1000),
+                          HR_CAP_DIR_EVENT, line);
+}
+
+/*
+ * Every byte, not the first 64.
+ *
+ * The cap kept a stray binary blob from filling the log, and it cost exactly
+ * the data it was meant to preserve: when a 6.0.644170 dryer switched to its
+ * encoded transport (2026-09-15), its 80- and 96-character frames were
+ * recorded as "stale 80: <64 chars>" - enough to see there was a frame, too
+ * short to ever decode one, and the first 304-byte burst kept 64. So the
+ * record is now the whole input, escaped, and when that outgrows one line it
+ * CONTINUES on the next:
+ *
+ *     ? stale 304: )S$C+]QWO...            as much as fits one line
+ *     ? stale 304 +512: ...                offset of the first byte shown
+ *
+ * Same timestamp, same direction column, so a reader stitches them by the
+ * "+offset". Bounded at the source by the stream buffer (HR_MAX_FRAME), so
+ * the worst case is one continuation line, not a runaway; the part limit is
+ * belt and braces.
+ */
+void hr_capture_rejected(uint32_t t_ms, const char *bytes, size_t n,
+                         const char *why)
+{
+    char line[HR_CAPTURE_LINE_MAX];
+    size_t i = 0;
+    unsigned parts = 0;
+    if (why == NULL) {
+        why = "rejected";
+    }
+    do {
+        int o = (parts == 0)
+                    ? snprintf(line, sizeof(line), "%s %u: ", why, (unsigned)n)
+                    : snprintf(line, sizeof(line), "%s %u +%u: ", why,
+                               (unsigned)n, (unsigned)i);
+        if (o < 0 || (size_t)o >= sizeof(line)) {
+            return;
+        }
+        /* An escaped byte takes four characters; leave room for one plus the
+         * NUL. Whatever does not fit goes on the next record. */
+        while (i < n && (size_t)o + 5 < sizeof(line)) {
+            unsigned char c = (unsigned char)bytes[i++];
+            if (c >= 0x20 && c < 0x7f && c != '\\') {
+                line[o++] = (char)c;
+            } else {
+                o += snprintf(line + o, sizeof(line) - (size_t)o, "\\x%02x", c);
+            }
+        }
+        line[o] = '\0';
+        hr_capture_append_dir(t_ms, HR_CAP_DIR_BAD, line);
+        parts++;
+    } while (i < n && parts < 8);
 }
 
 void hr_capture_enc(uint32_t t_ms, const char *frame, size_t len)
@@ -382,7 +515,7 @@ void hr_capture_enc(uint32_t t_ms, const char *frame, size_t len)
         return;
     }
     char line[HR_CAPTURE_LINE_MAX];
-    int o = snprintf(line, sizeof(line), "~enc %u ", (unsigned)len);
+    int o = snprintf(line, sizeof(line), "enc %u ", (unsigned)len);
     if (o < 0 || (size_t)o >= sizeof(line)) {
         return;
     }
@@ -393,7 +526,7 @@ void hr_capture_enc(uint32_t t_ms, const char *frame, size_t len)
     size_t take = len < room ? len : room;
     memcpy(line + o, frame, take);
     line[(size_t)o + take] = '\0';
-    hr_capture_append(t_ms, line);
+    hr_capture_append_dir(t_ms, HR_CAP_DIR_ENC, line);
 }
 
 unsigned long hr_capture_dropped(void) { return s_dropped; }
@@ -715,15 +848,24 @@ void hr_capture_mount_now(void)
      * afterwards meant querying a live device for a reason that is gone the
      * moment it restarts again. Now the log answers it.
      */
-    char boot[160];
-    int bn = snprintf(boot, sizeof(boot),
-                      "~boot reset=%s heap=%u seg%u used=%u",
-                      hr_reset_reason_str(),
-                      (unsigned)esp_get_free_heap_size(),
-                      (unsigned)s_seg, (unsigned)s_used);
-    if (bn > 0) {
-        hr_capture_append((uint32_t)(esp_timer_get_time() / 1000), boot);
+    {
+        uint8_t mac[6] = {0};
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        char head[200];
+        snprintf(head, sizeof(head),
+                 "# hr-capture v2 fw=%s reason=%s "
+                 "mac=%02x%02x%02x%02x%02x%02x columns=ms,epoch,dir,payload",
+                 FREEHARVEST_VERSION, hr_reset_reason_str(), mac[0], mac[1],
+                 mac[2], mac[3], mac[4], mac[5]);
+        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+            emit_raw(head);
+            xSemaphoreGive(s_lock);
+        }
     }
+    hr_capture_event("boot reset=%s heap=%u seg%u used=%u",
+                     hr_reset_reason_str(),
+                     (unsigned)esp_get_free_heap_size(), (unsigned)s_seg,
+                     (unsigned)s_used);
 }
 
 const char *hr_reset_reason_str(void)

@@ -353,6 +353,7 @@ static void on_reject(const char *bytes, size_t n, const char *why, void *user)
     shown[o] = '\0';
     ESP_LOGW(TAG, "RX rejected (%s, %u bytes): %s%s", why, (unsigned)n, shown,
              n > lim ? "..." : "");
+    hr_capture_rejected((uint32_t)now_ms(), bytes, n, why);
 }
 
 /*
@@ -784,6 +785,7 @@ void app_main(void)
         if (s_session.link != last_link) {
             last_link = s_session.link;
             ESP_LOGI(TAG, "link %s", last_link == HR_LINK_UP ? "UP" : "DOWN");
+            hr_capture_event("link %s", last_link == HR_LINK_UP ? "up" : "down");
         }
 
         /*
