@@ -30,6 +30,15 @@
 #include "hr_usb.h"
 #include "hr_wifi.h"
 
+/* T-Dongle-S3 screen / LED / button. Output only - see hr_display.h. */
+#if CONFIG_HR_DISPLAY || CONFIG_HR_LED || CONFIG_HR_BUTTON
+#define HR_HAVE_UI 1
+#include "hr_display.h"
+#include <stdio.h>
+#else
+#define HR_HAVE_UI 0
+#endif
+
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -250,11 +259,10 @@ static void on_inbound(const hr_frame_t *f, void *user)
 
     /* Persist every frame so a full cycle can be recovered later - the RAM
      * ring only holds a few minutes. */
-    {
-        char line[HR_MAX_FRAME];
-        if (hr_frame_tostring(f, line, sizeof(line)) > 0) {
-            hr_capture_append((uint32_t)now_ms(), line);
-        }
+    char line[HR_MAX_FRAME];
+    const bool have_line = hr_frame_tostring(f, line, sizeof(line)) > 0;
+    if (have_line) {
+        hr_capture_append((uint32_t)now_ms(), line);
     }
 
 #if CONFIG_HR_BATCH_HISTORY
@@ -269,6 +277,12 @@ static void on_inbound(const hr_frame_t *f, void *user)
         hr_http_set_telemetry(&tel);
         hr_http_set_tracker(&s_tracker);
         hr_mqtt_publish_telemetry(&tel);
+#if HR_HAVE_UI
+        /* A copy into the display's model; it draws on its own task. */
+        hr_display_post_telemetry(&tel, hr_phase_of_tracked(&tel, &s_tracker),
+                                  hr_freeze_eta_s(&s_tracker, &tel),
+                                  have_line ? line : NULL);
+#endif
 
         /*
          * Feed the graph series, and clear it when a new run begins.
@@ -332,12 +346,70 @@ static void on_inbound(const hr_frame_t *f, void *user)
     }
 
 #if CONFIG_HR_HTTP_LOG_TO_UART
-    char line[HR_MAX_FRAME];
-    if (hr_frame_tostring(f, line, sizeof(line)) > 0) {
+    if (have_line) {
         ESP_LOGI(TAG, "RX <- %s", line);
     }
 #endif
 }
+
+#if HR_HAVE_UI
+/*
+ * Everything the screen shows that is not telemetry, gathered from the same
+ * getters that feed /api/state. Posted from the main loop every tick; the
+ * display task copies and draws on its own schedule.
+ */
+static void post_display_status(void)
+{
+    hr_display_status_t s = {0};
+
+    switch (hr_wifi_status()) {
+    case HR_WIFI_AP_SETUP:
+        s.wifi = HR_UI_WIFI_AP_SETUP;
+        break;
+    case HR_WIFI_CONNECTING:
+        s.wifi = HR_UI_WIFI_CONNECTING;
+        break;
+    case HR_WIFI_CONNECTED:
+        s.wifi = HR_UI_WIFI_CONNECTED;
+        break;
+    default:
+        s.wifi = HR_UI_WIFI_NONE;
+        break;
+    }
+    hr_wifi_current_ssid(s.ssid, sizeof(s.ssid));
+    /* Window used up and no network to retry: setup is over for this boot. */
+    if (s.wifi == HR_UI_WIFI_CONNECTING && hr_wifi_ap_window_expired() &&
+        s.ssid[0] == '\0') {
+        s.wifi = HR_UI_WIFI_AP_CLOSED;
+    }
+    hr_wifi_ip(s.ip, sizeof(s.ip));
+    snprintf(s.ap_ssid, sizeof(s.ap_ssid), "%s", CONFIG_HR_AP_SSID);
+    s.rssi_dbm = hr_wifi_rssi_dbm();
+    s.ap_remaining_s = hr_wifi_ap_remaining_s();
+
+    s.mqtt_configured = hr_mqtt_configured();
+    s.mqtt_connected = hr_mqtt_connected();
+
+    s.usb_mounted = hr_usb_mounted();
+    s.usb_mounts = hr_usb_mount_events();
+    s.usb_rx_bytes = hr_usb_rx_bytes();
+    s.link_up = (s_session.link == HR_LINK_UP);
+    s.frames_bad = s_session.stream.frames_bad;
+    s.capture_dropped = hr_capture_dropped();
+    s.capture_used = hr_capture_size();
+    s.capture_cap = hr_capture_capacity();
+
+    snprintf(s.machine_name, sizeof(s.machine_name), "%s",
+             s_session.info.serial);
+    snprintf(s.fw_version, sizeof(s.fw_version), "%s",
+             s_session.info.fw_version);
+    snprintf(s.reset_reason, sizeof(s.reset_reason), "%s",
+             hr_reset_reason_str());
+    s.heap_free = (unsigned)esp_get_free_heap_size();
+
+    hr_display_post_status(&s);
+}
+#endif
 
 /*
  * Lines the parser refused. Until now they only bumped frames_bad; for a
@@ -447,6 +519,13 @@ void app_main(void)
      * a deferred task and is not available yet. The main loop initialises the
      * store once hr_capture_ready() reports the filesystem is up. */
     hr_batch_tracker_reset(&s_batch);
+
+#if HR_HAVE_UI
+    /* After hr_usb_init() and hr_capture_init(), for the same reason as
+     * the capture log: the LCD's SPI DMA buffers come from the pool TinyUSB
+     * needs for its endpoints, and the dryer link matters more. */
+    hr_display_init();
+#endif
 
     hr_wifi_start();
 
@@ -808,6 +887,9 @@ void app_main(void)
             xSemaphoreGive(s_hist_lock);
             hr_dryerfiles_tick(s_session.link == HR_LINK_UP, running);
         }
+#endif
+#if HR_HAVE_UI
+        post_display_status();
 #endif
         if (s_session.link != last_link) {
             last_link = s_session.link;

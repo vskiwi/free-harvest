@@ -527,6 +527,11 @@ bool hr_mqtt_set_broker(const char *host, int port, const char *user,
     return true;
 }
 
+bool hr_mqtt_configured(void)
+{
+    return s_host[0] != '\0';
+}
+
 size_t hr_mqtt_status_json(char *out, size_t cap)
 {
     return (size_t)snprintf(out, cap,
