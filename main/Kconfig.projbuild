@@ -60,6 +60,66 @@ config HR_DISPLAY_ROTATE_180
         MADCTL changes; the frame buffer, fonts, button and LED are
         unaffected.
 
+config HR_DISPLAY_AUTO_DIM
+    bool "Dim, then switch off the backlight when nothing happens"
+    depends on HR_DISPLAY
+    default y
+    help
+        The stick sits in the dryer around the clock. After HR_DISPLAY_DIM_S
+        without an event the backlight ramps down to HR_DISPLAY_DIM_PCT
+        (the screen keeps updating); after HR_DISPLAY_OFF_S the backlight
+        and the panel are switched off. Events that wake the screen: a
+        button press, the dryer changing phase (start, freeze -> dry,
+        complete), an alert, the USB link dropping or returning, Wi-Fi or
+        MQTT state changes. Plain telemetry updates (temperature, vacuum,
+        elapsed time) do not, or the screen would never dim during a run.
+        The IPS panel has no burn-in; this is about heat, backlight life
+        and glare at night. Disable to keep the old always-on behaviour.
+
+config HR_DISPLAY_DIM_S
+    int "Dim after (seconds of inactivity)"
+    depends on HR_DISPLAY_AUTO_DIM
+    range 5 86400
+    default 30
+
+config HR_DISPLAY_OFF_S
+    int "Switch the screen off after (seconds of inactivity, 0 = never)"
+    depends on HR_DISPLAY_AUTO_DIM
+    range 0 604800
+    default 300
+    help
+        Counted from the last event, like HR_DISPLAY_DIM_S, so it should be
+        larger than that; a value at or below HR_DISPLAY_DIM_S skips the
+        DIM stage. 0 keeps the screen dimmed but never off. While the
+        setup access point is open the screen never goes off: the user is
+        reading the network name and address off it. When the screen is
+        off, the first button press only wakes it (nothing else happens).
+
+config HR_DISPLAY_DIM_PCT
+    int "Dimmed backlight (%)"
+    depends on HR_DISPLAY_AUTO_DIM
+    range 1 99
+    default 10
+
+config HR_DISPLAY_ALERT_KEEP_ON
+    bool "Keep the screen at full brightness while an alert is showing"
+    depends on HR_DISPLAY_AUTO_DIM
+    default y
+    help
+        An alert that has not been acknowledged (link lost mid-run, dryer
+        diagnostics, bad frames...) holds the screen ACTIVE. Disable to let
+        it dim; it never goes off while an alert is active either way, and
+        an acknowledged alert (status-bar "!") allows DIM but not OFF.
+
+config HR_LED_DIM_WITH_DISPLAY
+    bool "Dim the RGB LED as well when the screen is off"
+    depends on HR_DISPLAY_AUTO_DIM && HR_LED
+    default y
+    help
+        With the screen off the LED keeps mirroring the machine state, but
+        capped at a low, still visible level (5 %) instead of its normal
+        10-30 %. Disable to keep the LED at full pattern brightness.
+
 config HR_AP_SSID
     string "Setup access-point SSID"
     default "HR-Adapter-Setup"

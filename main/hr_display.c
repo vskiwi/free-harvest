@@ -5,6 +5,7 @@
 #include "hr_display.h"
 
 #include "hr_http.h" /* FREEHARVEST_VERSION */
+#include "hr_ui_dim.h"
 
 #if CONFIG_HR_DISPLAY
 #include "hr_display_hw.h"
@@ -50,14 +51,25 @@ static const char *TAG = "hr_display";
 #define UI_PULSE_MS    120    /* LED flash on a new STAT */
 #define UI_BLINK_REDRAW_MS 500 /* screens with a 2 Hz element */
 
+/*
+ * Backlight ramp: the LEDC duty moves this many percent per poll, so a full
+ * 0 <-> 100 sweep takes UI_POLL_MS * 100 / BL_RAMP_STEP = 500 ms and the
+ * ACTIVE -> DIM step (90 points) about 450 ms. Nothing jumps.
+ */
+#define BL_RAMP_STEP   4
+
 static SemaphoreHandle_t s_lock;
 static hr_ui_model_t s_model;        /* shared: written by posts */
 static volatile bool s_dirty;        /* something changed since last draw */
 static volatile unsigned long s_pulse_ms;
 static hr_ui_state_t s_state;
-static int s_backlight_pct = -1;
+static hr_ui_dim_state_t s_dim;
+static hr_ui_dim_cfg_t s_dim_cfg;
+static int s_backlight_pct;          /* what the pin is at right now */
+static int s_backlight_target;       /* where the ramp is heading */
 #if CONFIG_HR_DISPLAY
 static bool s_have_panel;
+static bool s_panel_on;              /* DISPON, as opposed to sleeping dark */
 static uint32_t s_zone_hash[HR_ZONE_COUNT];
 static hr_ui_screen_t s_last_screen = HR_UI_SCREEN_BOOT;
 static bool s_first_draw = true;
@@ -194,8 +206,21 @@ static void draw(hr_ui_screen_t screen, const hr_ui_model_t *m,
 #endif
 }
 
-static void set_backlight(int pct)
+/* One ramp step towards s_backlight_target; called every poll. */
+static void backlight_ramp_step(void)
 {
+    int pct = s_backlight_pct;
+    if (pct < s_backlight_target) {
+        pct += BL_RAMP_STEP;
+        if (pct > s_backlight_target) {
+            pct = s_backlight_target;
+        }
+    } else if (pct > s_backlight_target) {
+        pct -= BL_RAMP_STEP;
+        if (pct < s_backlight_target) {
+            pct = s_backlight_target;
+        }
+    }
     if (pct != s_backlight_pct) {
         s_backlight_pct = pct;
 #if CONFIG_HR_DISPLAY
@@ -204,6 +229,34 @@ static void set_backlight(int pct)
         }
 #endif
     }
+}
+
+/*
+ * Apply a dim level: panel on/off and the backlight target. Order matters
+ * for the eyes: the panel is switched ON while the backlight is still at 0
+ * and only then ramped up (no white flash), and switched OFF only once the
+ * ramp has reached 0 (no visible collapse of the image).
+ */
+static void apply_dim_level(hr_ui_dim_level_t level, bool night_mode)
+{
+    const bool want_panel = level != HR_UI_DIM_OFF;
+#if CONFIG_HR_DISPLAY
+    if (s_have_panel && want_panel && !s_panel_on) {
+        hr_display_hw_panel_on(true);
+        s_panel_on = true;
+    }
+#endif
+    s_backlight_target =
+        night_mode ? 0 : hr_ui_dim_backlight_pct(&s_dim_cfg, level);
+    backlight_ramp_step();
+#if CONFIG_HR_DISPLAY
+    if (s_have_panel && !want_panel && s_panel_on && s_backlight_pct == 0) {
+        hr_display_hw_panel_on(false);
+        s_panel_on = false;
+    }
+#else
+    (void)want_panel;
+#endif
 }
 
 /* Screens with a sub-second element need redrawing faster than 1 Hz. */
@@ -225,7 +278,11 @@ static void ui_task(void *arg)
 
         hr_ui_button_event_t ev;
         if (hr_button_poll(now, &ev)) {
-            hr_ui_button(&s_state, ev, now);
+            /* A press on a dark screen only wakes it; the user cannot see
+             * what a short press would dismiss or a long press toggle. */
+            if (hr_ui_dim_button(&s_dim, now)) {
+                hr_ui_button(&s_state, ev, now);
+            }
             s_dirty = true;
         }
 
@@ -240,18 +297,28 @@ static void ui_task(void *arg)
                                                             : UI_TICK_MS;
         if (dirty || now - last_draw >= interval) {
             screen = hr_ui_select(&s_state, &m, now);
+            /* The frame buffer keeps updating whatever the backlight does,
+             * so a dim screen shows live numbers and a wake is instant. */
             draw(screen, &m, now);
             last_draw = now;
         }
 
-        /* Night mode: screen and LED dark. Otherwise full backlight. */
-        set_backlight(s_state.backlight_off ? 0 : 100);
+        /* Inactivity: ACTIVE -> DIM -> OFF, woken by events, floored by
+         * alerts and provisioning. Night mode (long press) is dark on top. */
+        const hr_ui_dim_level_t dim =
+            hr_ui_dim_update(&s_dim, &s_dim_cfg, &s_state, &m, now);
+        apply_dim_level(dim, s_state.backlight_off);
 
         hr_ui_led_t led = hr_ui_led_for(screen, &m, now);
         uint8_t level = hr_ui_led_level(&led, now);
         if (screen == HR_UI_SCREEN_RUN && now - s_pulse_ms < UI_PULSE_MS) {
             level = HR_UI_LED_MAX_PCT; /* one frame arrived: blink brighter */
         }
+#if CONFIG_HR_LED_DIM_WITH_DISPLAY
+        if (dim == HR_UI_DIM_OFF && level > HR_UI_LED_DIM_PCT) {
+            level = HR_UI_LED_DIM_PCT; /* still mirrors the state, quietly */
+        }
+#endif
         if (s_state.backlight_off) {
             level = 0;
         }
@@ -273,6 +340,22 @@ void hr_display_init(void)
     snprintf(s_model.ap_ssid, sizeof(s_model.ap_ssid), "%s", CONFIG_HR_AP_SSID);
     hr_ui_state_init(&s_state);
 
+    hr_ui_dim_cfg_default(&s_dim_cfg);
+#if CONFIG_HR_DISPLAY_AUTO_DIM
+    s_dim_cfg.enabled = true;
+    s_dim_cfg.dim_after_ms = (unsigned long)CONFIG_HR_DISPLAY_DIM_S * 1000UL;
+    s_dim_cfg.off_after_ms = (unsigned long)CONFIG_HR_DISPLAY_OFF_S * 1000UL;
+    s_dim_cfg.dim_pct = (uint8_t)CONFIG_HR_DISPLAY_DIM_PCT;
+#if CONFIG_HR_DISPLAY_ALERT_KEEP_ON
+    s_dim_cfg.alert_keep_on = true;
+#else
+    s_dim_cfg.alert_keep_on = false;
+#endif
+#else
+    s_dim_cfg.enabled = false;
+#endif
+    hr_ui_dim_init(&s_dim, s_model.boot_ms);
+
     hr_led_init();
     hr_button_init();
 #if CONFIG_HR_DISPLAY
@@ -281,19 +364,32 @@ void hr_display_init(void)
     if (!s_have_panel) {
         ESP_LOGW(TAG, "LCD not initialised; running LED/button only");
     }
+    s_panel_on = s_have_panel;
 #endif
+    /* Backlight is still off from hr_display_hw_init(); the task fades it
+     * in over 500 ms once the first frame is in GRAM. */
+    s_backlight_pct = 0;
+    s_backlight_target = 0;
 
     if (xTaskCreate(ui_task, "hr_ui", UI_TASK_STACK, NULL, UI_TASK_PRIO,
                     NULL) != pdPASS) {
         ESP_LOGE(TAG, "could not start the UI task");
         return;
     }
-#if CONFIG_HR_DISPLAY
-    /* Panel is initialised and the first frame is about to go out. */
-    if (s_have_panel) {
-        hr_display_hw_backlight(100);
-        s_backlight_pct = 100;
-    }
+    if (s_dim_cfg.enabled) {
+        ESP_LOGI(TAG, "display task running; auto-dim: %lu s -> %u %%, "
+                      "off after %lu s%s, alert keeps %s, LED %s when off",
+                 s_dim_cfg.dim_after_ms / 1000, (unsigned)s_dim_cfg.dim_pct,
+                 s_dim_cfg.off_after_ms / 1000,
+                 s_dim_cfg.off_after_ms == 0 ? " (never)" : "",
+                 s_dim_cfg.alert_keep_on ? "ACTIVE" : "DIM",
+#if CONFIG_HR_LED_DIM_WITH_DISPLAY
+                 "dimmed"
+#else
+                 "unchanged"
 #endif
-    ESP_LOGI(TAG, "display task running");
+        );
+    } else {
+        ESP_LOGI(TAG, "display task running; auto-dim off (always on)");
+    }
 }

@@ -210,6 +210,21 @@ backlight and LED off and on again. There is no code path from the button to
 the USB link; a stray press on a stick protruding from the machine cannot start
 or stop a batch.
 
+**Auto-dim.** The stick lives in the dryer around the clock, so the backlight
+does not stay at full brightness: 30 s after the last event it fades to 10 %
+(the screen keeps updating), and after 5 min the backlight and panel switch
+off. Events that wake it: a button press, the dryer changing phase (start,
+freezing → drying, complete), an alert, the USB link dropping or returning,
+Wi-Fi or MQTT state changes — plain temperature/vacuum updates do not. An
+unacknowledged alert holds full brightness; an acknowledged one and the open
+setup hotspot keep it at least dimmed, never off. When the screen is off, the
+first press only wakes it. The LED keeps mirroring the state at a low level.
+Change the timings or turn it off under **Free Harvest Adapter →
+Dim, then switch off the backlight** (`CONFIG_HR_DISPLAY_AUTO_DIM`,
+`CONFIG_HR_DISPLAY_DIM_S`, `CONFIG_HR_DISPLAY_OFF_S` (0 = never off),
+`CONFIG_HR_DISPLAY_DIM_PCT`, `CONFIG_HR_DISPLAY_ALERT_KEEP_ON`,
+`CONFIG_HR_LED_DIM_WITH_DISPLAY`) in `idf.py -B build-tdongle menuconfig`.
+
 **Build.** The board is a Kconfig choice layered on the normal defaults. Use a
 separate build directory *and* a separate sdkconfig, so the generic build is
 untouched:

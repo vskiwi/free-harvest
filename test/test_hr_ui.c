@@ -1,3 +1,4 @@
+#include "hr_ui_dim.h"
 #include "hr_ui_model.h"
 #include "test_util.h"
 
@@ -403,6 +404,248 @@ static void test_format_helpers(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Backlight inactivity state machine                                  */
+/* ------------------------------------------------------------------ */
+
+/* select + dim update in one go, the way the ui task does it. */
+static hr_ui_dim_level_t tick(hr_ui_dim_state_t *d, const hr_ui_dim_cfg_t *c,
+                              hr_ui_state_t *st, const hr_ui_model_t *m,
+                              unsigned long now)
+{
+    hr_ui_select(st, m, now);
+    return hr_ui_dim_update(d, c, st, m, now);
+}
+
+/* Running dryer, Wi-Fi up, splash over, dim state seeded at t0. */
+static void dim_running(hr_ui_model_t *m, hr_ui_state_t *st,
+                        hr_ui_dim_state_t *d, hr_ui_dim_cfg_t *c,
+                        unsigned long t0)
+{
+    fresh(m, st);
+    hr_ui_dim_cfg_default(c);
+    m->wifi = HR_UI_WIFI_CONNECTED;
+    m->mqtt_configured = true;
+    m->mqtt_connected = true;
+    dryer_running(m, HR_PHASE_FREEZING);
+    hr_ui_dim_init(d, t0);
+    CHECK_INT(tick(d, c, st, m, t0), HR_UI_DIM_ACTIVE);
+    CHECK_INT(st->screen, HR_UI_SCREEN_RUN);
+}
+
+static void test_dim_defaults_and_timeouts(void)
+{
+    TEST_CASE("dim: defaults; ACTIVE -> DIM at 30 s -> OFF at 300 s");
+    hr_ui_model_t m;
+    hr_ui_state_t st;
+    hr_ui_dim_state_t d;
+    hr_ui_dim_cfg_t c;
+    dim_running(&m, &st, &d, &c, 100000);
+
+    CHECK(c.enabled);
+    CHECK_INT(c.dim_after_ms, 30000);
+    CHECK_INT(c.off_after_ms, 300000);
+    CHECK_INT(c.dim_pct, 10);
+    CHECK(c.alert_keep_on);
+    CHECK_INT(hr_ui_dim_backlight_pct(&c, HR_UI_DIM_ACTIVE), 100);
+    CHECK_INT(hr_ui_dim_backlight_pct(&c, HR_UI_DIM_DIM), 10);
+    CHECK_INT(hr_ui_dim_backlight_pct(&c, HR_UI_DIM_OFF), 0);
+    CHECK_STR(hr_ui_dim_level_name(HR_UI_DIM_DIM), "DIM");
+
+    CHECK_INT(tick(&d, &c, &st, &m, 129999), HR_UI_DIM_ACTIVE);
+    CHECK_INT(tick(&d, &c, &st, &m, 130000), HR_UI_DIM_DIM);
+    CHECK_INT(tick(&d, &c, &st, &m, 399999), HR_UI_DIM_DIM);
+    CHECK_INT(tick(&d, &c, &st, &m, 400000), HR_UI_DIM_OFF);
+    CHECK_INT(tick(&d, &c, &st, &m, 4000000), HR_UI_DIM_OFF);
+
+    /* off_after 0: dims, never switches off. */
+    c.off_after_ms = 0;
+    CHECK_INT(tick(&d, &c, &st, &m, 4000001), HR_UI_DIM_DIM);
+    /* off_after <= dim_after: straight to OFF. */
+    c.off_after_ms = 30000;
+    hr_ui_dim_wake(&d, 5000000);
+    CHECK_INT(tick(&d, &c, &st, &m, 5029999), HR_UI_DIM_ACTIVE);
+    CHECK_INT(tick(&d, &c, &st, &m, 5030000), HR_UI_DIM_OFF);
+    /* Master switch off: always ACTIVE. */
+    c.enabled = false;
+    CHECK_INT(tick(&d, &c, &st, &m, 9000000), HR_UI_DIM_ACTIVE);
+    c.enabled = true;
+    c.dim_after_ms = 0; /* "never dim" spelled as 0 */
+    CHECK_INT(tick(&d, &c, &st, &m, 9000001), HR_UI_DIM_ACTIVE);
+}
+
+static void test_dim_telemetry_does_not_wake(void)
+{
+    TEST_CASE("dim: temperature/vacuum/elapsed ticks do not wake, phase does");
+    hr_ui_model_t m;
+    hr_ui_state_t st;
+    hr_ui_dim_state_t d;
+    hr_ui_dim_cfg_t c;
+    dim_running(&m, &st, &d, &c, 100000);
+
+    /* A STAT every few seconds for ten minutes, numbers moving. */
+    for (unsigned long t = 101000; t <= 700000; t += 5000) {
+        m.tel.temp_f -= 1;
+        m.tel.vacuum_um += 3;
+        m.tel.phase_elapsed_s += 5;
+        m.tel.batch_elapsed_s += 5;
+        m.tel.rx_ms = t;
+        m.rssi_dbm = (int)(-50 - (t / 5000) % 7);
+        m.heap_free = 150000 + (unsigned)(t % 1000);
+        hr_ui_dim_update(&d, &c, &st, &m, t); /* also fine without select */
+    }
+    CHECK_INT(tick(&d, &c, &st, &m, 700001), HR_UI_DIM_OFF);
+    CHECK_INT(d.last_event_ms, 100000);
+
+    /* Phase change wakes: freezing -> drying. */
+    m.tel.phase = HR_PHASE_DRYING;
+    m.tel.type = 5;
+    CHECK_INT(tick(&d, &c, &st, &m, 700002), HR_UI_DIM_ACTIVE);
+    CHECK_INT(d.last_event_ms, 700002);
+    CHECK_INT(tick(&d, &c, &st, &m, 730002), HR_UI_DIM_DIM);
+
+    /* Batch complete wakes (screen RUN -> COMPLETE, phase too). */
+    m.tel.phase = HR_PHASE_COMPLETE;
+    m.tel.type = 7;
+    CHECK_INT(tick(&d, &c, &st, &m, 731000), HR_UI_DIM_ACTIVE);
+    CHECK_INT(st.screen, HR_UI_SCREEN_COMPLETE);
+    CHECK_INT(tick(&d, &c, &st, &m, 731000 + 300000), HR_UI_DIM_OFF);
+
+    /* Wi-Fi state change wakes; so does MQTT dropping; so does the USB
+     * link going away (here: idle dryer, no alert). */
+    m.wifi = HR_UI_WIFI_CONNECTING;
+    CHECK_INT(tick(&d, &c, &st, &m, 1040000), HR_UI_DIM_ACTIVE);
+    CHECK_INT(tick(&d, &c, &st, &m, 1340000), HR_UI_DIM_OFF);
+    m.mqtt_connected = false;
+    CHECK_INT(tick(&d, &c, &st, &m, 1340001), HR_UI_DIM_ACTIVE);
+    CHECK_INT(tick(&d, &c, &st, &m, 1640001), HR_UI_DIM_OFF);
+    m.tel.phase = HR_PHASE_IDLE;
+    m.tel.type = 1;
+    tick(&d, &c, &st, &m, 1640002);
+    tick(&d, &c, &st, &m, 1940002 + HR_UI_RUN_RECENT_MS);
+    CHECK_INT(d.level, HR_UI_DIM_OFF);
+    m.link_up = false;
+    CHECK_INT(tick(&d, &c, &st, &m, 1940003 + HR_UI_RUN_RECENT_MS),
+              HR_UI_DIM_ACTIVE);
+    CHECK_INT(st.alert, HR_UI_ALERT_NONE); /* idle dryer silent: no alert */
+    m.link_up = true;
+    CHECK_INT(tick(&d, &c, &st, &m, 1940004 + HR_UI_RUN_RECENT_MS),
+              HR_UI_DIM_ACTIVE);
+}
+
+static void test_dim_alert_floor(void)
+{
+    TEST_CASE("dim: alert wakes and keeps ACTIVE; dismissed -> DIM, never OFF");
+    hr_ui_model_t m;
+    hr_ui_state_t st;
+    hr_ui_dim_state_t d;
+    hr_ui_dim_cfg_t c;
+    dim_running(&m, &st, &d, &c, 100000);
+    CHECK_INT(tick(&d, &c, &st, &m, 400000), HR_UI_DIM_OFF);
+
+    /* Link lost mid-run: ALERT screen, screen wakes and stays awake. */
+    m.link_up = false;
+    CHECK_INT(tick(&d, &c, &st, &m, 400001), HR_UI_DIM_ACTIVE);
+    CHECK_INT(st.screen, HR_UI_SCREEN_ALERT);
+    CHECK_INT(tick(&d, &c, &st, &m, 400001 + 3600000), HR_UI_DIM_ACTIVE);
+
+    /* Acknowledged: may dim, but not go off while the alert is latched. */
+    hr_ui_button(&st, HR_UI_BUTTON_SHORT, 4000002);
+    CHECK_INT(tick(&d, &c, &st, &m, 4000002), HR_UI_DIM_ACTIVE);
+    CHECK_INT(st.screen, HR_UI_SCREEN_NO_DRYER);
+    /* (the button press itself is a wake in the real task; emulate) */
+    hr_ui_dim_wake(&d, 4000002);
+    CHECK_INT(tick(&d, &c, &st, &m, 4030002), HR_UI_DIM_DIM);
+    CHECK_INT(tick(&d, &c, &st, &m, 4030002 + 3600000), HR_UI_DIM_DIM);
+
+    /* Link back: alert clears (an event), then normal timing resumes. */
+    m.link_up = true;
+    CHECK_INT(tick(&d, &c, &st, &m, 8000000), HR_UI_DIM_ACTIVE);
+    CHECK_INT(st.alert, HR_UI_ALERT_NONE);
+    CHECK_INT(tick(&d, &c, &st, &m, 8300000), HR_UI_DIM_OFF);
+
+    /* alert_keep_on = false: a showing alert still floors at DIM. */
+    c.alert_keep_on = false;
+    m.link_up = false;
+    CHECK_INT(tick(&d, &c, &st, &m, 8300001), HR_UI_DIM_ACTIVE); /* woke */
+    CHECK_INT(st.screen, HR_UI_SCREEN_ALERT);
+    CHECK_INT(tick(&d, &c, &st, &m, 8330001), HR_UI_DIM_DIM);
+    CHECK_INT(tick(&d, &c, &st, &m, 8330001 + 3600000), HR_UI_DIM_DIM);
+}
+
+static void test_dim_provisioning_never_off(void)
+{
+    TEST_CASE("dim: setup AP open -> DIM at most, never OFF");
+    hr_ui_model_t m;
+    hr_ui_state_t st;
+    hr_ui_dim_state_t d;
+    hr_ui_dim_cfg_t c;
+    fresh(&m, &st);
+    hr_ui_dim_cfg_default(&c);
+    m.wifi = HR_UI_WIFI_AP_SETUP;
+    m.ap_remaining_s = 300;
+    hr_ui_dim_init(&d, 0);
+    CHECK_INT(tick(&d, &c, &st, &m, 0), HR_UI_DIM_ACTIVE);
+    CHECK_INT(st.screen, HR_UI_SCREEN_BOOT);
+    /* Splash over -> PROVISION is a screen change: still ACTIVE at 3 s. */
+    CHECK_INT(tick(&d, &c, &st, &m, 3000), HR_UI_DIM_ACTIVE);
+    CHECK_INT(st.screen, HR_UI_SCREEN_PROVISION);
+    CHECK_INT(tick(&d, &c, &st, &m, 33000), HR_UI_DIM_DIM);
+    CHECK_INT(tick(&d, &c, &st, &m, 3000 + 300000), HR_UI_DIM_DIM);
+    CHECK_INT(tick(&d, &c, &st, &m, 3000 + 3600000), HR_UI_DIM_DIM);
+
+    /* Window closed: an event, then the normal path to OFF is open. */
+    m.wifi = HR_UI_WIFI_AP_CLOSED;
+    m.ap_remaining_s = 0;
+    CHECK_INT(tick(&d, &c, &st, &m, 4000000), HR_UI_DIM_ACTIVE);
+    CHECK_INT(tick(&d, &c, &st, &m, 4300000), HR_UI_DIM_OFF);
+
+    /* Someone joins and reopens setup: awake again, floored at DIM. */
+    m.wifi = HR_UI_WIFI_AP_SETUP;
+    CHECK_INT(tick(&d, &c, &st, &m, 4300001), HR_UI_DIM_ACTIVE);
+    CHECK_INT(tick(&d, &c, &st, &m, 4300001 + 600000), HR_UI_DIM_DIM);
+}
+
+static void test_dim_button_when_off(void)
+{
+    TEST_CASE("dim: press on a dark screen only wakes; otherwise wakes AND acts");
+    hr_ui_model_t m;
+    hr_ui_state_t st;
+    hr_ui_dim_state_t d;
+    hr_ui_dim_cfg_t c;
+    dim_running(&m, &st, &d, &c, 100000);
+
+    /* ACTIVE: forwarded (INFO comes up) and the timer restarts. */
+    CHECK_INT(tick(&d, &c, &st, &m, 120000), HR_UI_DIM_ACTIVE);
+    CHECK(hr_ui_dim_button(&d, 120000));
+    hr_ui_button(&st, HR_UI_BUTTON_SHORT, 120000);
+    CHECK_INT(tick(&d, &c, &st, &m, 120000), HR_UI_DIM_ACTIVE);
+    CHECK_INT(st.screen, HR_UI_SCREEN_INFO);
+    CHECK_INT(tick(&d, &c, &st, &m, 149999), HR_UI_DIM_ACTIVE);
+    /* INFO timing out and returning to RUN is not an event. */
+    CHECK_INT(tick(&d, &c, &st, &m, 150000), HR_UI_DIM_DIM);
+    CHECK_INT(st.screen, HR_UI_SCREEN_RUN);
+
+    /* DIM: forwarded too - the screen is readable. */
+    CHECK(hr_ui_dim_button(&d, 150001));
+    CHECK_INT(d.level, HR_UI_DIM_ACTIVE);
+    CHECK_INT(tick(&d, &c, &st, &m, 150001), HR_UI_DIM_ACTIVE);
+
+    /* OFF: the first press only wakes, nothing is forwarded. */
+    CHECK_INT(tick(&d, &c, &st, &m, 450001), HR_UI_DIM_OFF);
+    hr_ui_state_t before = st;
+    CHECK(!hr_ui_dim_button(&d, 450002));
+    CHECK_INT(d.level, HR_UI_DIM_ACTIVE);
+    CHECK(memcmp(&before, &st, sizeof(st)) == 0); /* caller did not act */
+    CHECK_INT(tick(&d, &c, &st, &m, 450002), HR_UI_DIM_ACTIVE);
+    CHECK_INT(st.screen, HR_UI_SCREEN_RUN);
+    /* The second press is a normal one. */
+    CHECK(hr_ui_dim_button(&d, 451000));
+    hr_ui_button(&st, HR_UI_BUTTON_SHORT, 451000);
+    CHECK_INT(tick(&d, &c, &st, &m, 451000), HR_UI_DIM_ACTIVE);
+    CHECK_INT(st.screen, HR_UI_SCREEN_INFO);
+}
+
 int main(void)
 {
     test_boot_then_provision();
@@ -414,5 +657,10 @@ int main(void)
     test_button_touches_only_ui_state();
     test_led_table();
     test_format_helpers();
+    test_dim_defaults_and_timeouts();
+    test_dim_telemetry_does_not_wake();
+    test_dim_alert_floor();
+    test_dim_provisioning_never_off();
+    test_dim_button_when_off();
     return TEST_REPORT();
 }
