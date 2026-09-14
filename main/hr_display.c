@@ -79,7 +79,12 @@ void hr_display_post_telemetry(const hr_telemetry_t *t, hr_phase_t phase,
         return;
     }
     const unsigned long now = now_ms();
-    xSemaphoreTake(s_lock, portMAX_DELAY);
+    /* Called on the TinyUSB task: the ui task only ever holds the lock for a
+     * struct copy, but never let USB servicing wait on the display. A sample
+     * dropped here is redrawn from the next STAT seconds later. */
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return;
+    }
     hr_ui_telemetry_t *tel = &s_model.tel;
     tel->valid = true;
     tel->type = t->type;
