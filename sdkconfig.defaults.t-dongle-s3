@@ -51,3 +51,11 @@ CONFIG_HR_BUTTON=y
 # The dryer's USB port is on its right side, so the stick hangs plug-right:
 # rotate 180 degrees from the vendor's plug-left orientation.
 CONFIG_HR_DISPLAY_ROTATE_180=y
+# Backlight: full for 30 s after an event, 10 % until 5 min, then off. An
+# unacknowledged alert and the open setup AP keep it readable.
+CONFIG_HR_DISPLAY_AUTO_DIM=y
+CONFIG_HR_DISPLAY_DIM_S=30
+CONFIG_HR_DISPLAY_OFF_S=300
+CONFIG_HR_DISPLAY_DIM_PCT=10
+CONFIG_HR_DISPLAY_ALERT_KEEP_ON=y
+CONFIG_HR_LED_DIM_WITH_DISPLAY=y

@@ -24,6 +24,14 @@ bool hr_display_hw_init(void);
 void hr_display_hw_backlight(uint8_t pct);
 
 /*
+ * Panel output on/off (ST7735 DISPON/DISPOFF). GRAM is kept, and
+ * hr_display_hw_flush() still writes to it while off, so switching back on
+ * shows the current frame at once. Call with the backlight at 0 to avoid a
+ * flash of whatever the panel latches while it wakes.
+ */
+void hr_display_hw_panel_on(bool on);
+
+/*
  * Push a rectangle of pixels (row-major, w*h entries, wire byte order).
  * Blocks until the DMA transfer has completed, so the buffer may be reused
  * on return. Returns false on a transfer error.

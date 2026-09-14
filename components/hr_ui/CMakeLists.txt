@@ -3,7 +3,7 @@
 # must stay unconditional - ESP-IDF reads it before sdkconfig exists.)
 set(srcs)
 if(CONFIG_HR_BOARD_T_DONGLE_S3)
-    list(APPEND srcs "hr_ui_model.c")
+    list(APPEND srcs "hr_ui_model.c" "hr_ui_dim.c")
 endif()
 
 idf_component_register(
