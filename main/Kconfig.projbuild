@@ -119,4 +119,15 @@ config HR_LOG_RING_KB
         of a busy link. Boards without PSRAM that carry other RAM users can
         turn this down; the ring only ever drops its oldest lines.
 
+config HR_CAPTURE_RAW
+    bool "Capture log: keep every frame verbatim (no repeat collapsing)"
+    default n
+    help
+        By default consecutive identical frames (an idle dryer's REQINFO
+        every 10 s) are collapsed into one "repeat ... xN" summary line to
+        save flash. Enable this when recording traffic for protocol work,
+        where the exact cadence of every frame matters more than space.
+        On a 16 MB board the 11.9 MB capture partition holds several days
+        of raw traffic even so.
+
 endmenu
