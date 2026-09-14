@@ -423,8 +423,19 @@ static esp_err_t h_capture(httpd_req_t *req)
 {
     bool degraded = false;      /* the flash log was there and would not read */
     httpd_resp_set_type(req, "text/plain");
-    httpd_resp_set_hdr(req, "Content-Disposition",
-                       "attachment; filename=hr_capture.txt");
+    /* Name the file by wall-clock time when the browser has told us it, so
+     * a folder of captures sorts itself; by uptime otherwise. */
+    static char disp[96];
+    if (hr_time_known()) {
+        snprintf(disp, sizeof(disp),
+                 "attachment; filename=hr_capture_%lu.txt",
+                 (unsigned long)hr_time_now());
+    } else {
+        snprintf(disp, sizeof(disp),
+                 "attachment; filename=hr_capture_up%lus.txt",
+                 (unsigned long)(esp_timer_get_time() / 1000000));
+    }
+    httpd_resp_set_hdr(req, "Content-Disposition", disp);
 
     /*
      * Prefer the persistent flash log - it holds a whole cycle. Fall back to
@@ -496,11 +507,19 @@ ram_fallback:;
     n = hr_history_since(s_history, 0, out, HR_HIST_CAP);
     UNLOCK();
 
+    /* Same v2 columns as the flash log, so one parser reads both. The RAM
+     * ring holds inbound frames only and no wall-clock time. */
+    static const char k_head[] =
+        "# hr-capture v2 fw=" FREEHARVEST_VERSION " source=ram-ring "
+        "columns=ms,epoch,dir,payload\n";
+    httpd_resp_send_chunk(req, k_head, sizeof(k_head) - 1);
     char line[HR_HIST_BODY + 32];
     for (int i = 0; i < n; i++) {
-        int len = snprintf(line, sizeof(line), "%" PRIu32 "\t%" PRIu32 "\t%s\n",
-                           out[i].seq, out[i].t_ms, out[i].body);
-        httpd_resp_send_chunk(req, line, len);
+        int len = snprintf(line, sizeof(line), "%" PRIu32 "\t-\t>\t%s\n",
+                           out[i].t_ms, out[i].body);
+        if (len > 0 && httpd_resp_send_chunk(req, line, len) != ESP_OK) {
+            return ESP_FAIL;
+        }
     }
     return httpd_resp_sendstr_chunk(req, NULL);
 }

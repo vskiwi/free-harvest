@@ -1,4 +1,5 @@
 #include "hr_usb.h"
+#include "hr_capture.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -79,6 +80,7 @@ void tud_mount_cb(void)
     s_mount_events++;
     ESP_LOGI(TAG, "USB mounted: host enumerated us (mount #%u)",
              (unsigned)s_mount_events);
+    hr_capture_event("usb mount #%u", (unsigned)s_mount_events);
 }
 
 void tud_umount_cb(void)
@@ -93,6 +95,7 @@ void tud_umount_cb(void)
      */
     tud_cdc_n_write_clear(CDC_ITF);
     ESP_LOGW(TAG, "USB unmounted: host dropped us (TX queue cleared)");
+    hr_capture_event("usb umount");
 }
 
 void tud_suspend_cb(bool remote_wakeup_en)
@@ -100,12 +103,14 @@ void tud_suspend_cb(bool remote_wakeup_en)
     s_suspended = true;
     ESP_LOGW(TAG, "USB suspended (remote wakeup %s)",
              remote_wakeup_en ? "enabled" : "disabled");
+    hr_capture_event("usb suspend");
 }
 
 void tud_resume_cb(void)
 {
     s_suspended = false;
     ESP_LOGI(TAG, "USB resumed");
+    hr_capture_event("usb resume");
 }
 
 /*
@@ -131,6 +136,9 @@ static void on_line_coding(int itf, cdcacm_event_t *event)
     ESP_LOGI(TAG, "line coding: %lu baud, %u data bits, %u stop, parity %u",
              (unsigned long)c->bit_rate, (unsigned)c->data_bits,
              (unsigned)c->stop_bits, (unsigned)c->parity);
+    hr_capture_event("usb linecoding %lu %u%c%u", (unsigned long)c->bit_rate,
+                     (unsigned)c->data_bits, "NOEMS"[c->parity < 5 ? c->parity : 0],
+                     (unsigned)c->stop_bits);
 }
 
 /*
@@ -177,6 +185,7 @@ static void on_line_state(int itf, cdcacm_event_t *event)
     bool rts = event->line_state_changed_data.rts;
     s_host_present = dtr;
     ESP_LOGI(TAG, "line state: dtr=%d rts=%d", (int)dtr, (int)rts);
+    hr_capture_event("usb dtr=%d rts=%d", (int)dtr, (int)rts);
 }
 
 bool hr_usb_tx(const char *data, size_t len, void *user)
@@ -281,6 +290,21 @@ bool hr_usb_tx(const char *data, size_t len, void *user)
     }
     if (s_tx_lock != NULL) {
         xSemaphoreGive(s_tx_lock);
+    }
+    /* Our half of the conversation goes into the capture log as well. */
+    {
+        char line[HR_MAX_FRAME];
+        size_t n = (len < sizeof(line) - 1) ? len : sizeof(line) - 1;
+        memcpy(line, data, n);
+        while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == '\n')) {
+            n--;
+        }
+        line[n] = '\0';
+        if (ok) {
+            hr_capture_append_dir((uint32_t)now_ms(), HR_CAP_DIR_TX, line);
+        } else {
+            hr_capture_event("tx failed: %s", line);
+        }
     }
     return ok;
 }

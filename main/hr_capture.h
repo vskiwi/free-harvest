@@ -6,8 +6,22 @@
  * inbound frame to a file in a dedicated SPIFFS partition so a whole cycle can
  * be downloaded afterwards - and survives reboots and power cuts.
  *
- * Format: one line per frame, "<millis>\t<frame body>\n" - the same shape the
- * existing /api/capture download produces, so tooling keeps working.
+ * Format v2: one line per event, four tab-separated columns:
+ *
+ *     <millis>\t<epoch|->\t<dir>\t<payload>
+ *
+ *   millis   milliseconds since boot (esp_timer)
+ *   epoch    Unix seconds when the browser has set the clock, else "-"
+ *   dir      >  frame from the dryer            <  frame we sent
+ *            !  adapter event (usb/link/boot)   ?  bytes the parser rejected
+ *            ~  run summary ("repeat <body> xN first..last")
+ *   payload  the frame without its CR; events as short text; rejected bytes
+ *            printable as-is and otherwise \xNN
+ *
+ * The file begins (after every mount) with "# hr-capture v2 ..." naming the
+ * firmware and the columns. Format v1 was "<millis>\t<body>" and recorded
+ * only the inbound side; both directions plus USB events are what make a
+ * capture usable for decoding the protocol.
  */
 #ifndef HR_CAPTURE_H
 #define HR_CAPTURE_H
@@ -55,6 +69,25 @@ bool hr_capture_ready(void);
  * silent.
  */
 void hr_capture_append(uint32_t t_ms, const char *body);
+
+/* Direction markers for hr_capture_append_dir(). */
+#define HR_CAP_DIR_RX    '>'
+#define HR_CAP_DIR_TX    '<'
+#define HR_CAP_DIR_EVENT '!'
+#define HR_CAP_DIR_BAD   '?'
+
+/* As hr_capture_append(), with an explicit direction column. Same rules:
+ * non-blocking, safe from the USB task, dropped and counted when full. */
+void hr_capture_append_dir(uint32_t t_ms, char dir, const char *body);
+
+/* Record an adapter event ("usb mount #2", "link down", ...) with the
+ * current uptime. printf-style; the result is capped to one line. */
+void hr_capture_event(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/* Record bytes the frame parser rejected: printable ASCII as-is, anything
+ * else as \xNN, capped to `n` <= 64 bytes of input. */
+void hr_capture_rejected(uint32_t t_ms, const char *bytes, size_t n,
+                         const char *why);
 
 /* Frame lines discarded because the write queue was full. */
 unsigned long hr_capture_dropped(void);
