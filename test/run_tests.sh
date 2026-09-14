@@ -5,9 +5,9 @@ set -u
 
 cd "$(dirname "$0")/.."
 CC=${CC:-gcc}
-CFLAGS="-std=c11 -Wall -Wextra -Werror -g -Icomponents/hr_protocol/include -Imain -Itest"
+CFLAGS="-std=c11 -Wall -Wextra -Werror -g -Icomponents/hr_protocol/include -Icomponents/hr_ui/include -Imain -Itest"
 # main/hr_logring.c is the one piece of main/ with no ESP-IDF dependency.
-SRC="$(ls components/hr_protocol/*.c) main/hr_logring.c"
+SRC="$(ls components/hr_protocol/*.c components/hr_ui/*.c) main/hr_logring.c"
 OUT_DIR="${TMPDIR:-/tmp}/hr_tests"
 mkdir -p "$OUT_DIR"
 
