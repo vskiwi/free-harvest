@@ -1,5 +1,62 @@
 menu "Free Harvest Adapter"
 
+choice HR_BOARD
+    prompt "Target board"
+    default HR_BOARD_DEVKITC
+    help
+        Which board the firmware is built for. The protocol, web UI, MQTT
+        and capture log are identical on every board; the choice only adds
+        the peripherals a particular board carries. The default keeps the
+        build exactly as it always was for a bare ESP32-S3 DevKitC.
+
+config HR_BOARD_DEVKITC
+    bool "ESP32-S3 DevKitC-1 (no display, no LED, no button)"
+
+config HR_BOARD_T_DONGLE_S3
+    bool "LilyGo T-Dongle-S3 (0.96\" ST7735 LCD, APA102 LED, BOOT button)"
+    help
+        USB-A stick with an 80x160 colour LCD, one RGB LED and one button.
+        Note the board has a single USB port that TinyUSB takes over for the
+        dryer, so the serial console is only reachable on UART0 (GPIO43/44,
+        the QWIIC connector on recent revisions) or through /api/log.
+
+endchoice
+
+config HR_DISPLAY
+    bool "Status display on the on-board LCD"
+    depends on HR_BOARD_T_DONGLE_S3
+    default y
+    help
+        Show the cycle phase, temperature, vacuum and connection state on the
+        LCD. Purely an output: nothing on the display path can send a frame
+        to the dryer.
+
+config HR_LED
+    bool "Mirror the state on the RGB LED"
+    depends on HR_BOARD_T_DONGLE_S3
+    default y
+    help
+        Colour = phase, blink/breathe = attention needed. Brightness is capped
+        at 30 % because the LED sits inside a closed case next to the antenna.
+
+config HR_BUTTON
+    bool "Use the BOOT button to switch screens / toggle the backlight"
+    depends on HR_BOARD_T_DONGLE_S3
+    default y
+    help
+        Short press: dismiss an alert, or cycle main -> info -> raw frame.
+        Long press (1.5 s): backlight and LED off/on. The button never sends
+        anything to the dryer - a stray press on a stick protruding from the
+        machine must not be able to start or stop a batch.
+
+config HR_UI_ROTATION_180
+    bool "Rotate the display 180 degrees"
+    depends on HR_DISPLAY
+    default n
+    help
+        The default orientation reads correctly with the USB plug on the
+        left. Enable this if the dryer's port puts the stick in upside down.
+
 config HR_AP_SSID
     string "Setup access-point SSID"
     default "HR-Adapter-Setup"
