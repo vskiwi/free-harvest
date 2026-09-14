@@ -225,6 +225,17 @@ bool hr_display_hw_init(void)
     return true;
 }
 
+void hr_display_hw_panel_on(bool on)
+{
+    if (s_panel == NULL) {
+        return;
+    }
+    esp_err_t err = esp_lcd_panel_disp_on_off(s_panel, on);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "disp_on_off(%d): %s", (int)on, esp_err_to_name(err));
+    }
+}
+
 bool hr_display_hw_flush(int x, int y, int w, int h, const uint16_t *pixels)
 {
     if (s_panel == NULL || w <= 0 || h <= 0) {
