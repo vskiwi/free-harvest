@@ -70,6 +70,18 @@ void hr_wifi_current_ssid(char *out, size_t cap);
  * shows. */
 int hr_wifi_rssi_pct(void);
 
+/* Raw signal in dBm, 0 when not associated. */
+int hr_wifi_rssi_dbm(void);
+
+/*
+ * Seconds left in the one-time setup-AP window, 0 when the AP is not
+ * broadcasting (never opened, closed on connect, or expired).
+ */
+long hr_wifi_ap_remaining_s(void);
+
+/* True once the window has closed with no home network joined. */
+bool hr_wifi_ap_window_expired(void);
+
 /* Store new credentials, then reconnect. Returns false on bad input. */
 bool hr_wifi_set_credentials(const char *ssid, const char *password);
 
