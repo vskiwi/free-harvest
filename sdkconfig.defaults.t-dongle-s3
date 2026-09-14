@@ -1,0 +1,46 @@
+# LilyGo T-Dongle-S3 - overlay applied on top of sdkconfig.defaults.
+#
+#   idf.py -B build-tdongle \
+#       -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.t-dongle-s3" \
+#       set-target esp32s3 build
+#
+# Board: bare ESP32-S3 with 16 MB Quad-SPI flash (W25Q128), NO PSRAM, an
+# 80x160 ST7735 LCD, one APA102 RGB LED and one button, all inside a USB-A
+# stick. Pins are in main/board_t_dongle_s3.h.
+#
+# Console. The board has ONE USB connector and the ESP32-S3 has ONE USB PHY.
+# This firmware hands the PHY to TinyUSB so the dryer can enumerate us as a
+# CDC device, which means USB-Serial/JTAG is gone the moment the app starts:
+# `idf.py monitor` over the stick's own plug cannot work, and the secondary
+# USB_SERIAL_JTAG console must be disabled so its driver does not touch the
+# PHY registers while TinyUSB owns them. UART0 (GPIO43 TX / GPIO44 RX,
+# 115200) is the only real console; it is exposed on the 4-pin JST-SH
+# "QWIIC" connector of the 2023+ revision only. Without it, logs are at
+# http://<ip>/api/log.
+#
+# Flashing. The ROM bootloader still talks USB-Serial/JTAG regardless of the
+# app: hold the BOOT button while plugging the stick into the computer, then
+#   idf.py -B build-tdongle -p /dev/cu.usbmodem* flash
+# Every later update can go over Wi-Fi (Settings -> Update).
+
+# --- Flash: 16 MB W25Q128, QIO at 80 MHz (the vendor's own board file).
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-16mb.csv"
+
+# PSRAM: the plain T-Dongle-S3 has none. Do NOT set CONFIG_SPIRAM here; the
+# frame buffer (25.6 KB) lives in internal RAM.
+
+# --- Console: UART0 only, no USB-Serial/JTAG secondary (see above).
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# --- Board peripherals.
+CONFIG_HR_BOARD_T_DONGLE_S3=y
+CONFIG_HR_DISPLAY=y
+CONFIG_HR_LED=y
+CONFIG_HR_BUTTON=y
