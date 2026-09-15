@@ -35,6 +35,10 @@ typedef enum {
     HR_UI_WIFI_AP_CLOSED,  /* 5-minute window over, nothing joined */
     HR_UI_WIFI_CONNECTING, /* trying the stored network */
     HR_UI_WIFI_CONNECTED,  /* station up with an IP */
+    /* Associated but no IPv4 address for a while (DHCP lease lost or never
+     * granted); the adapter is restarting DHCP / rejoining by itself.
+     * Not connected for every purpose the screen cares about. */
+    HR_UI_WIFI_NO_IP,
 } hr_ui_wifi_t;
 
 /* Longest slice of the raw STAT body the RAW screen can show: 5 x 26. */
