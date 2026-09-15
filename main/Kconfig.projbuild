@@ -120,6 +120,32 @@ config HR_LED_DIM_WITH_DISPLAY
         capped at a low, still visible level (5 %) instead of its normal
         10-30 %. Disable to keep the LED at full pattern brightness.
 
+menu "Bench debugging over USB (not for the dryer)"
+
+config HR_USB_LOG_CDC
+    bool "Mirror the ESP log to a second USB CDC port (CDC1)"
+    depends on TINYUSB_CDC_COUNT = 2
+    default n
+    help
+        With CONFIG_TINYUSB_CDC_COUNT=2 the stick enumerates as two serial
+        ports: CDC0 stays the dryer protocol exactly as before, CDC1 carries
+        every ESP_LOG line, non-blocking (lines are dropped, and counted,
+        while nobody reads the port). For a bench with a computer as the
+        USB host: boards whose only USB port TinyUSB owns have no other
+        live console. Do NOT ship this to the dryer - its host stack has
+        only ever been seen with a single-CDC or CDC+MSC device.
+
+config HR_USB_TRACE_RX
+    bool "Log every raw USB RX chunk (length + first bytes)"
+    default n
+    help
+        One INFO line per chunk the CDC RX callback drains, with the length
+        and the first 32 bytes (printable as-is, the rest as \xNN), BEFORE
+        the frame parser sees them. Answers "does anything at all arrive
+        from the dryer" even when nothing parses. Noisy; bench builds only.
+
+endmenu
+
 config HR_AP_SSID
     string "Setup access-point SSID"
     default "HR-Adapter-Setup"
