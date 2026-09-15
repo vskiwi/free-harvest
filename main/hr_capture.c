@@ -2,6 +2,7 @@
 #include "hr_batchstore.h" /* hr_time_now */
 #include "hr_http.h"       /* FREEHARVEST_VERSION */
 #include "hr_quiesce.h"
+#include "hr_usb.h"        /* bus state for the first lines of a capture */
 
 #include "esp_mac.h"
 #include "esp_timer.h"
@@ -866,6 +867,16 @@ void hr_capture_mount_now(void)
                      hr_reset_reason_str(),
                      (unsigned)esp_get_free_heap_size(), (unsigned)s_seg,
                      (unsigned)s_used);
+    /*
+     * USB state at the moment recording starts. The host enumerates us within
+     * a second of boot, well before this mount finishes, so the "usb mount"
+     * event itself is nearly always lost - and a log with no mount line then
+     * reads as "the dryer never enumerated us", which on the bench was the
+     * opposite of the truth. Say what the bus looks like right now instead.
+     */
+    hr_capture_event("usb state mounted=%d mounts=%u suspended=%d rx_bytes=%lu",
+                     (int)hr_usb_mounted(), hr_usb_mount_events(),
+                     (int)hr_usb_suspended(), hr_usb_rx_bytes());
 }
 
 const char *hr_reset_reason_str(void)
