@@ -416,26 +416,76 @@ void hr_capture_event(const char *fmt, ...)
                           HR_CAP_DIR_EVENT, line);
 }
 
+/*
+ * Every byte, not the first 64.
+ *
+ * The cap kept a stray binary blob from filling the log, and it cost exactly
+ * the data it was meant to preserve: when a 6.0.644170 dryer switched to its
+ * encoded transport (2026-09-15), its 80- and 96-character frames were
+ * recorded as "stale 80: <64 chars>" - enough to see there was a frame, too
+ * short to ever decode one, and the first 304-byte burst kept 64. So the
+ * record is now the whole input, escaped, and when that outgrows one line it
+ * CONTINUES on the next:
+ *
+ *     ? stale 304: )S$C+]QWO...            as much as fits one line
+ *     ? stale 304 +512: ...                offset of the first byte shown
+ *
+ * Same timestamp, same direction column, so a reader stitches them by the
+ * "+offset". Bounded at the source by the stream buffer (HR_MAX_FRAME), so
+ * the worst case is one continuation line, not a runaway; the part limit is
+ * belt and braces.
+ */
 void hr_capture_rejected(uint32_t t_ms, const char *bytes, size_t n,
                          const char *why)
 {
-    char line[4 * 64 + 48];
-    size_t lim = n < 64 ? n : 64;
-    int o = snprintf(line, sizeof(line), "%s %u: ", why ? why : "rejected",
-                     (unsigned)n);
-    if (o < 0) {
+    char line[HR_CAPTURE_LINE_MAX];
+    size_t i = 0;
+    unsigned parts = 0;
+    if (why == NULL) {
+        why = "rejected";
+    }
+    do {
+        int o = (parts == 0)
+                    ? snprintf(line, sizeof(line), "%s %u: ", why, (unsigned)n)
+                    : snprintf(line, sizeof(line), "%s %u +%u: ", why,
+                               (unsigned)n, (unsigned)i);
+        if (o < 0 || (size_t)o >= sizeof(line)) {
+            return;
+        }
+        /* An escaped byte takes four characters; leave room for one plus the
+         * NUL. Whatever does not fit goes on the next record. */
+        while (i < n && (size_t)o + 5 < sizeof(line)) {
+            unsigned char c = (unsigned char)bytes[i++];
+            if (c >= 0x20 && c < 0x7f && c != '\\') {
+                line[o++] = (char)c;
+            } else {
+                o += snprintf(line + o, sizeof(line) - (size_t)o, "\\x%02x", c);
+            }
+        }
+        line[o] = '\0';
+        hr_capture_append_dir(t_ms, HR_CAP_DIR_BAD, line);
+        parts++;
+    } while (i < n && parts < 8);
+}
+
+void hr_capture_enc(uint32_t t_ms, const char *frame, size_t len)
+{
+    if (frame == NULL || len == 0) {
         return;
     }
-    for (size_t i = 0; i < lim && (size_t)o + 5 < sizeof(line); i++) {
-        unsigned char c = (unsigned char)bytes[i];
-        if (c >= 0x20 && c < 0x7f && c != '\\') {
-            line[o++] = (char)c;
-        } else {
-            o += snprintf(line + o, sizeof(line) - (size_t)o, "\\x%02x", c);
-        }
+    char line[HR_CAPTURE_LINE_MAX];
+    int o = snprintf(line, sizeof(line), "enc %u ", (unsigned)len);
+    if (o < 0 || (size_t)o >= sizeof(line)) {
+        return;
     }
-    line[o] = '\0';
-    hr_capture_append_dir(t_ms, HR_CAP_DIR_BAD, line);
+    /* The frame is bounded by HR_ENC_MAX_FRAME (511) at the source and the
+     * line by HR_CAPTURE_LINE_MAX (544), so this never actually truncates;
+     * the clamp is there so it cannot overrun if either constant moves. */
+    size_t room = sizeof(line) - 1 - (size_t)o;
+    size_t take = len < room ? len : room;
+    memcpy(line + o, frame, take);
+    line[(size_t)o + take] = '\0';
+    hr_capture_append_dir(t_ms, HR_CAP_DIR_ENC, line);
 }
 
 unsigned long hr_capture_dropped(void) { return s_dropped; }
