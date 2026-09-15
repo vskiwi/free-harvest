@@ -1,5 +1,6 @@
 #include "hr_mqtt.h"
 #include "hr_http.h"
+#include "hr_units.h"
 
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -29,7 +30,10 @@ static const char *TAG = "hr_mqtt";
  */
 #define PUB_QUEUE_DEPTH 4
 typedef struct {
-    char json[256];
+    /* A state document; an EMPTY string is the request to re-publish the
+     * discovery configs (hr_mqtt_rediscover), which must also run off the
+     * publisher task rather than whichever task noticed the change. */
+    char json[320];
 } pub_item_t;
 static QueueHandle_t s_pub_queue;
 static TaskHandle_t s_pub_task;
@@ -112,6 +116,8 @@ static void pub(const char *topic, const char *payload, int retain)
     }
 }
 
+static void publish_discovery(void);
+
 /* The publisher task: drains the queue and does the blocking publishes. */
 static void pub_task(void *arg)
 {
@@ -127,8 +133,12 @@ static void pub_task(void *arg)
             continue; /* a reconfigure is in progress; this sample is stale */
         }
         if (s_client && s_connected) {
-            /* retained so HA shows the last value after a restart */
-            esp_mqtt_client_publish(s_client, topic, item.json, 0, 1, 1);
+            if (item.json[0] == '\0') {
+                publish_discovery();
+            } else {
+                /* retained so HA shows the last value after a restart */
+                esp_mqtt_client_publish(s_client, topic, item.json, 0, 1, 1);
+            }
         }
         xSemaphoreGive(s_client_lock);
     }
@@ -222,8 +232,14 @@ static void publish_discovery(void)
     snprintf(cfg, sizeof(cfg), "%s/config/set", s_base);
 
     /* Sensors (value_templates read the state JSON from hr_telemetry_to_json) */
-    discover_sensor("temp", "Temperature", "\\u00b0F", "temperature",
-                    "{{ value_json.temp_f }}");
+    /* Temperature in the owner's unit (Settings > Units): the state document
+     * carries `temp` converted to it and `temp_unit` naming it, next to the
+     * dryer's own `temp_f`. The discovery config and the value it reads are
+     * therefore always in the same unit, and hr_mqtt_rediscover() re-sends
+     * this when the owner switches. */
+    const bool metric = hr_units_temp() == HR_TEMP_C;
+    discover_sensor("temp", "Temperature", metric ? "\\u00b0C" : "\\u00b0F",
+                    "temperature", "{{ value_json.temp }}");
     discover_sensor("pressure", "Pressure (raw)", "", "",
                     "{{ value_json.pressure }}");
     discover_sensor("state_type", "State Code", "", "",
@@ -482,10 +498,24 @@ void hr_mqtt_publish_telemetry(const hr_telemetry_t *t)
         return;
     }
     pub_item_t item;
-    if (hr_telemetry_to_json(t, item.json, sizeof(item.json)) == 0) {
+    if (hr_telemetry_to_json_unit(t, hr_units_temp(), item.json,
+                                  sizeof(item.json)) == 0) {
         return;
     }
     (void)xQueueSend(s_pub_queue, &item, 0);
+}
+
+void hr_mqtt_rediscover(void)
+{
+    if (!s_connected || s_pub_queue == NULL) {
+        return;
+    }
+    pub_item_t item;
+    item.json[0] = '\0';
+    if (xQueueSend(s_pub_queue, &item, 0) == pdTRUE) {
+        ESP_LOGI(TAG, "re-publishing HA discovery (temperature unit: %s)",
+                 hr_temp_unit_letter(hr_units_temp()));
+    }
 }
 
 void hr_mqtt_publish_frame(const char *verb, const char *body)
