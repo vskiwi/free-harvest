@@ -223,11 +223,24 @@ def to_frames(lines, path):
     return 0
 
 
-def replay(lines, port, speed, baud, timeout_s):
+def replay(lines, port, speed, baud, timeout_s, max_stall_s=0.0):
+    """
+    Play the dryer's side of a capture into a real adapter.
+
+    Behaves like the dryer, which never waits for anything: frames go out on
+    their recorded schedule (scaled by --speed) whether or not the adapter
+    has answered, and whatever the adapter sends is read by a separate thread
+    so a silent adapter never stalls the sender. The one thing that CAN stall
+    the sender is the adapter refusing bytes at USB level (its RX FIFO full
+    because its TinyUSB task is not running) - the OS then blocks write().
+    That is a firmware fault worth seeing, so writes carry a timeout and every
+    stall is reported with its duration instead of hanging the tool.
+    """
     try:
         import serial
     except ImportError:
         sys.exit("pyserial missing:  python3 -m pip install pyserial")
+    import threading
 
     lines = expand_repeats(lines)
     rx = [l for l in lines if l.dir == ">"]
@@ -235,49 +248,96 @@ def replay(lines, port, speed, baud, timeout_s):
     if not rx:
         sys.exit("nothing to replay: the capture has no '>' lines")
 
-    ser = serial.serial_for_url(port, baudrate=baud, timeout=0.05)
+    WRITE_TIMEOUT = 1.0
+    ser = serial.serial_for_url(port, baudrate=baud, timeout=0.05,
+                                write_timeout=WRITE_TIMEOUT)
     time.sleep(0.3)
     ser.reset_input_buffer()
 
     got_tx = []          # (wall_ms, text) what the adapter actually sent
-    buf = b""
     t_wall0 = time.time()
     t_cap0 = rx[0].ms
+    stop = threading.Event()
+    lock = threading.Lock()
 
-    def drain():
-        nonlocal buf
-        try:
-            chunk = ser.read(512)
-        except Exception as e:
-            print(f"   (port error: {e})")
-            return
-        if not chunk:
-            return
-        buf += chunk
-        while CR in buf:
-            line, buf = buf.split(CR, 1)
-            text = line.decode("ascii", "replace").strip()
-            if text:
-                ms = int((time.time() - t_wall0) * 1000)
-                got_tx.append((ms, text))
-                print(f"{ms:>9} <- {text}")
+    def wall_ms():
+        return int((time.time() - t_wall0) * 1000)
 
+    def reader():
+        buf = b""
+        while not stop.is_set():
+            try:
+                chunk = ser.read(512)
+            except Exception as e:
+                if not stop.is_set():
+                    print(f"   (port read error: {e})")
+                return
+            if not chunk:
+                continue
+            buf += chunk
+            while CR in buf:
+                line, buf = buf.split(CR, 1)
+                text = line.decode("ascii", "replace").strip()
+                if text:
+                    ms = wall_ms()
+                    with lock:
+                        got_tx.append((ms, text))
+                        print(f"{ms:>9} <- {text}")
+
+    rd = threading.Thread(target=reader, name="adapter-rx", daemon=True)
+    rd.start()
+
+    stalls = []          # (frame_index, seconds) writes the adapter refused
     print(f"replaying {len(rx)} dryer frames over {port} at {speed}x; "
           f"{len(expected_tx)} adapter frames to compare against")
-    for l in rx:
+    for i, l in enumerate(rx):
         due = (l.ms - t_cap0) / 1000.0 / speed
-        while time.time() - t_wall0 < due:
-            drain()
+        wait = due - (time.time() - t_wall0)
+        if wait > 0:
+            time.sleep(wait)
         raw = l.payload.encode("ascii", "replace") + CR
-        ser.write(raw)
-        ser.flush()
-        print(f"{int((time.time() - t_wall0) * 1000):>9} -> {l.payload}")
-        drain()
+        t_w = time.time()
+        while True:
+            try:
+                ser.write(raw)
+                ser.flush()
+                break
+            except serial.SerialTimeoutException:
+                stalled = time.time() - t_w
+                if stalled < 2 * WRITE_TIMEOUT:
+                    with lock:
+                        print(f"{wall_ms():>9} !! write stalled: the adapter is "
+                              f"not accepting bytes (frame {i + 1}: {l.payload})")
+                if max_stall_s and stalled >= max_stall_s:
+                    with lock:
+                        print(f"{wall_ms():>9} !! giving up after {stalled:.1f}s "
+                              f"(--max-stall)")
+                    stalls.append((i, stalled))
+                    stop.set()
+                    ser.close()
+                    return 3
+        stalled = time.time() - t_w
+        if stalled >= WRITE_TIMEOUT:
+            stalls.append((i, stalled))
+            with lock:
+                print(f"{wall_ms():>9} !! adapter accepted bytes again after "
+                      f"{stalled:.1f}s")
+        with lock:
+            late = (time.time() - t_wall0) - due
+            tag = f"  (late {late:.1f}s)" if late > 1.0 else ""
+            print(f"{wall_ms():>9} -> {l.payload}{tag}")
     # let the adapter finish answering
-    end = time.time() + timeout_s
-    while time.time() < end:
-        drain()
+    time.sleep(timeout_s)
+    stop.set()
     ser.close()
+    rd.join(timeout=1.0)
+
+    if stalls:
+        worst = max(s for _, s in stalls)
+        print()
+        print(f"=== USB write stalls: {len(stalls)} (longest {worst:.1f}s) - the "
+              f"adapter stopped draining its RX FIFO; a real dryer would have "
+              f"given up on the link ===")
 
     # Compare by verb sequence, ignoring fields that legitimately differ
     # (uptime, RSSI, counters) - a field-exact match would fail on every
@@ -296,6 +356,8 @@ def replay(lines, port, speed, baud, timeout_s):
     if not expected_tx:
         print("  (capture has no adapter frames - v1 file; live side listed only)")
     print(f"{'OK' if mismatch == 0 else 'DIFFERENCES: %d verbs' % mismatch}")
+    if stalls:
+        return 3
     return 0 if mismatch == 0 else 2
 
 
@@ -312,6 +374,9 @@ def main():
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--settle", type=float, default=3.0,
                     help="seconds to keep listening after the last frame")
+    ap.add_argument("--max-stall", type=float, default=0.0, metavar="SEC",
+                    help="abort when the adapter refuses bytes for this long "
+                         "(0 = keep waiting and report the stall)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -325,7 +390,8 @@ def main():
     if args.to_frames:
         return to_frames(lines, args.to_frames)
     if args.port:
-        return replay(lines, args.port, args.speed, args.baud, args.settle)
+        return replay(lines, args.port, args.speed, args.baud, args.settle,
+                      args.max_stall)
     return summarise(header, lines, args.verbose)
 
 
