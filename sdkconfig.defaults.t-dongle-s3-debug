@@ -1,0 +1,24 @@
+# LilyGo T-Dongle-S3 - BENCH DEBUG overlay, applied on top of the board file:
+#
+#   idf.py -B build-tdongle-debug -D SDKCONFIG=build-tdongle-debug/sdkconfig \
+#       -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.t-dongle-s3;sdkconfig.defaults.t-dongle-s3-debug" \
+#       set-target esp32s3 build
+#
+# The stick enumerates as TWO serial ports. CDC0 is the dryer protocol,
+# byte for byte the same as the production build; CDC1 carries the ESP log
+# (every line, non-blocking, dropped and counted while nobody reads it).
+# On a Mac they appear as /dev/cu.usbmodem<serial>1 and ...3; open the
+# second with `screen /dev/cu.usbmodemXXXX3 115200`.
+#
+# Every raw RX chunk on CDC0 is also logged (length + first 32 bytes) before
+# the parser sees it, and USB bus events (mount/umount/suspend/resume, line
+# state, line coding) are already logged at INFO/WARN by hr_usb.c.
+#
+# NOT for the dryer: its USB host has only been seen with single-CDC and
+# CDC+MSC devices, and the PID changes (0x4002 instead of 0x4001). Flash the
+# production build (build-tdongle) before plugging the stick back into the
+# machine. Everything else - memory budget, display, Wi-Fi - is identical.
+CONFIG_TINYUSB_CDC_COUNT=2
+CONFIG_HR_USB_LOG_CDC=y
+CONFIG_HR_USB_TRACE_RX=y
+CONFIG_TINYUSB_DESC_PRODUCT_STRING="Free Harvest (bench debug)"
