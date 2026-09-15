@@ -178,6 +178,11 @@ static void progress_pct(int pct, uint16_t color, const char *label)
     progress_clear(HR_UI_C_BLACK);
     char t[8];
     if (label == NULL) {
+        if (pct < 0) {
+            pct = 0;
+        } else if (pct > 100) {
+            pct = 100;
+        }
         snprintf(t, sizeof(t), "%3d%%", pct);
         label = t;
     }
