@@ -11,6 +11,7 @@
 #include "hr_usb.h"
 #include "hr_wifi.h"
 #include "hr_compat.h"
+#include "hr_units.h"
 
 #include "esp_app_desc.h"
 #include "esp_app_format.h"
@@ -292,7 +293,17 @@ static esp_err_t h_state(httpd_req_t *req)
         enc_age_ms = (long)(now - enc_last_ms);
     }
 
-    char body[2432];
+    /* The owner's unit, and the shelf temperature in it. temp_f stays the
+     * dryer's own whole degrees F for every consumer that already reads it. */
+    const hr_temp_unit_t unit = hr_units_temp();
+    char temp_num[16];
+    if (hr_temp_fmt_num(tel_valid ? tel.temperature_f : 0, unit, temp_num,
+                        sizeof(temp_num)) == 0) {
+        temp_num[0] = '0';
+        temp_num[1] = '\0';
+    }
+
+    char body[2496];
     int n = snprintf(body, sizeof(body),
                      "{\"link\":\"%s\",\"serial\":\"%s\",\"uid\":\"%s\","
                      "\"dryer_sn\":\"%s\","
@@ -322,7 +333,12 @@ static esp_err_t h_state(httpd_req_t *req)
                      "\"sta_assoc\":%s,\"noip_s\":%lu,\"noip_episodes\":%u,"
                      "\"noip_dhcp_restarts\":%u,\"noip_reconnects\":%u,"
                      "\"phase\":%d,\"phase_label\":\"%s\",\"have_tel\":%s,"
-                     "\"temp_f\":%ld,\"pressure\":%ld,\"elapsed_s\":%ld,"
+                     /* temp_f: the wire value, degrees F. temp / temp_unit:
+                      * the same reading in the owner's unit (Settings >
+                      * Units, /api/units) - whole F or one-decimal C. */
+                     "\"temp_f\":%ld,\"temp\":%s,\"temp_unit\":\"%s\","
+                     "\"temp_pref\":\"%s\","
+                     "\"pressure\":%ld,\"elapsed_s\":%ld,"
                      "\"prep_s\":%ld,\"mode\":\"%s\",\"stat_type\":%d,"
                      "\"freeze_pct\":%ld,\"freeze_eta_s\":%ld,"
                      "\"phase_pct\":%ld,\"phase_s\":%ld,"
@@ -356,7 +372,9 @@ static esp_err_t h_state(httpd_req_t *req)
                      noip.associated ? "true" : "false", noip.noip_s,
                      noip.episodes, noip.dhcp_restarts, noip.reconnects,
                      (int)ph, hr_phase_label(ph), tel_valid ? "true" : "false",
-                     tel_valid ? tel.temperature_f : 0,
+                     tel_valid ? tel.temperature_f : 0, temp_num,
+                     hr_temp_unit_letter(unit),
+                     hr_temp_pref_str(hr_units_pref()),
                      tel_valid ? tel.pressure_raw : 0,
                      tel_valid ? tel.batch_elapsed_s : 0,
                      tel_valid ? tel.prep_remaining_s : 0,
@@ -1392,6 +1410,68 @@ static esp_err_t h_compat_post(httpd_req_t *req)
                      "{\"ok\":true,\"compat644170\":%s,\"stored\":%s}",
                      on ? "true" : "false", stored ? "true" : "false");
     return send_json(req, out, (size_t)n);
+}
+
+/*
+ * GET  /api/units                  -> {"temp_unit":"F","temp_pref":"f"}
+ * POST /api/units  temp_unit=f|c   (also accepts "fahrenheit"/"celsius",
+ *                                   "imperial"/"metric", "auto")
+ *
+ * The temperature unit every reading is presented in: /api/state (temp,
+ * temp_unit), the web UI, MQTT / Home Assistant (state JSON + discovery
+ * unit) and the display on boards that have one. Stored in NVS. The dryer
+ * is not involved - it sends F regardless and is told nothing - so this is
+ * a pure presentation setting and carries the same PIN gate as the other
+ * adapter settings, no more.
+ */
+static size_t units_json(char *out, size_t cap, bool ok, bool stored)
+{
+    return (size_t)snprintf(out, cap,
+                            "{\"ok\":%s,\"temp_unit\":\"%s\","
+                            "\"temp_pref\":\"%s\",\"stored\":%s}",
+                            ok ? "true" : "false",
+                            hr_temp_unit_letter(hr_units_temp()),
+                            hr_temp_pref_str(hr_units_pref()),
+                            stored ? "true" : "false");
+}
+
+static esp_err_t h_units_get(httpd_req_t *req)
+{
+    char out[96];
+    size_t n = units_json(out, sizeof(out), true, true);
+    return send_json(req, out, n);
+}
+
+static esp_err_t h_units_post(httpd_req_t *req)
+{
+    char buf[96];
+    int got = read_form(req, buf, sizeof(buf));
+    if (got < 0) {
+        return httpd_resp_send_500(req);
+    }
+
+    if (!pin_guard(req, buf)) {
+        return ESP_OK;
+    }
+
+    char v[16] = {0};
+    if (httpd_query_key_value(buf, "temp_unit", v, sizeof(v)) != ESP_OK &&
+        httpd_query_key_value(buf, "units", v, sizeof(v)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(
+            req, "{\"ok\":false,\"reason\":\"temp_unit=f|c required\"}");
+    }
+    hr_temp_pref_t pref;
+    if (!hr_temp_pref_parse(v, &pref)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(
+            req, "{\"ok\":false,\"reason\":\"temp_unit must be f or c\"}");
+    }
+    bool stored = hr_units_set_pref(pref);
+
+    char out[96];
+    size_t n = units_json(out, sizeof(out), true, stored);
+    return send_json(req, out, n);
 }
 
 /*
@@ -2802,6 +2882,8 @@ void hr_http_start(hr_session_t *session, hr_history_t *history)
     reg("/api/wififlags", HTTP_POST, h_wififlags);
     reg("/api/compat", HTTP_GET, h_compat_get);
     reg("/api/compat", HTTP_POST, h_compat_post);
+    reg("/api/units", HTTP_GET, h_units_get);
+    reg("/api/units", HTTP_POST, h_units_post);
     reg("/api/dryer/reboot", HTTP_POST, h_dryer_reboot);
     reg("/img/*", HTTP_GET, h_img);
     /* Captive-portal probes (Android/Apple/Windows). */

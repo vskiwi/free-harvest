@@ -14,6 +14,7 @@
 #include "hr_capture.h"
 #include "hr_batchstore.h"
 #include "hr_compat.h"
+#include "hr_units.h"
 #include "hr_encring.h"
 #include "hr_enc.h"
 #include "hr_http.h"
@@ -489,6 +490,9 @@ void app_main(void)
     /* The 6.0.644170 handshake switch, NVS-backed; applied in the loop below
      * so a runtime change also restarts the handshake. */
     hr_compat_init();
+    /* Temperature unit for everything that shows one (web, MQTT, display);
+     * NVS-backed, presentation only - the dryer keeps sending F. */
+    hr_units_init();
 
     hr_usb_init(&s_session);
 
