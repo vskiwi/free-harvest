@@ -89,6 +89,13 @@ typedef struct {
     char reset_reason[12];
     unsigned heap_free;
 
+    /*
+     * Present temperatures in Celsius. The owner's setting (hr_units.h,
+     * Settings > Temperature unit); tel.temp_f itself is always the dryer's
+     * degrees F and converts only when spelled (hr_ui_fmt_temp).
+     */
+    bool metric;
+
     hr_ui_telemetry_t tel;
 } hr_ui_model_t;
 

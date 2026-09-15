@@ -402,6 +402,21 @@ static void test_format_helpers(void)
     CHECK_STR(b, "100" HR_UI_DEG "C");
     hr_ui_fmt_temp(124, true, b, sizeof(b));
     CHECK_STR(b, "51" HR_UI_DEG "C");
+    /* The live dryer's freezing shelf: 24 F is -4.4 C, spelled -4 on the
+     * small display; 23 F is -5. */
+    hr_ui_fmt_temp(24, true, b, sizeof(b));
+    CHECK_STR(b, "-4" HR_UI_DEG "C");
+    hr_ui_fmt_temp(23, true, b, sizeof(b));
+    CHECK_STR(b, "-5" HR_UI_DEG "C");
+    hr_ui_fmt_temp(24, false, b, sizeof(b));
+    CHECK_STR(b, "24" HR_UI_DEG "F");
+
+    /* A fresh model presents in Fahrenheit - what the dryer's panel shows. */
+    {
+        hr_ui_model_t fresh;
+        hr_ui_model_init(&fresh);
+        CHECK(!fresh.metric);
+    }
 
     hr_ui_fmt_vac(435, true, b, sizeof(b));
     CHECK_STR(b, "435 mT");
