@@ -38,6 +38,56 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-16mb.csv"
 # PSRAM: the plain T-Dongle-S3 has none. Do NOT set CONFIG_SPIRAM here; the
 # frame buffer (25.6 KB) lives in internal RAM.
 
+# --- RAM budget. Everything below buys DRAM back; nothing here changes what
+# the firmware does.
+#
+# The ESP32-S3 has 512 KB of SRAM, of which the app can use about 340 KB
+# for code-in-RAM + static data + heap (the rest is cache and ROM reserve).
+# Upstream's generic build already places ~260 KB of that statically; this
+# board adds a 25.6 KB frame buffer and the LCD/LED drivers, and the field
+# result was 25 KB of heap after Wi-Fi came up, falling to 14 KB once MQTT
+# and a browser joined - at which point Wi-Fi/lwIP start failing
+# allocations and the link flaps. Measured on this build:
+#
+#   -Os instead of -Og ............................ ~12 KB of IRAM code
+#   Wi-Fi code out of IRAM (IRAM_OPT, RX_IRAM_OPT) ~37 KB of IRAM code
+#   FreeRTOS/heap/ringbuf/PHY/SPI-ISR into flash .. ~10 KB of IRAM code
+#   smaller Wi-Fi buffer pools .................... ~20 KB of heap at run time
+#   no IPv6 ....................................... ~3 KB of heap + code
+#
+# IRAM-resident code and DRAM share the same SRAM on this chip, so every
+# KB of code moved to flash is a KB of heap. The cost is Wi-Fi throughput
+# (irrelevant: the dryer emits a frame every few seconds and the web UI is
+# a single page) and slightly slower response while SPIFFS writes disable
+# the cache for a few ms.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+CONFIG_ESP_PHY_IRAM_OPT=n
+# (FreeRTOS and ringbuf are in flash by default since IDF 6.) Heap functions
+# to flash as well; that also moves the SPI master ISR (LCD DMA) out of
+# IRAM, which IDF requires when the heap is not IRAM-resident.
+CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
+# Wi-Fi buffer pools: the defaults (10 static RX, 32/32 dynamic, BA window
+# 6) are sized for streaming. Halved; the BA windows follow the IDF
+# guidance of "at most half the buffer count".
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_RX_BA_WIN=4
+CONFIG_ESP_WIFI_TX_BA_WIN=4
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=16
+# Features the firmware cannot use: it only ever joins an SSID+passphrase
+# network and only ever speaks plain mqtt://.
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
+CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT=n
+CONFIG_ESP_WIFI_ENABLE_WPA3_OWE_STA=n
+CONFIG_LWIP_IPV6=n
+CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES=n
+CONFIG_MQTT_TRANSPORT_WEBSOCKET=n
+# In-app log ring: 24 KB packed still holds ~370 lines (was 55 KB for 384).
+CONFIG_HR_LOG_RING_KB=24
+
 # --- Console: UART0 only, no USB-Serial/JTAG secondary (see above).
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
