@@ -136,6 +136,7 @@ void hr_display_post_status(const hr_display_status_t *s)
         m->mqtt_connected != s->mqtt_connected ||
         m->frames_bad != s->frames_bad ||
         m->capture_dropped != s->capture_dropped ||
+        m->metric != s->temp_metric ||
         strcmp(m->ip, s->ip) != 0 || strcmp(m->ssid, s->ssid) != 0 ||
         strcmp(m->machine_name, s->machine_name) != 0;
     m->wifi = s->wifi;
@@ -158,6 +159,7 @@ void hr_display_post_status(const hr_display_status_t *s)
     snprintf(m->fw_version, sizeof(m->fw_version), "%s", s->fw_version);
     snprintf(m->reset_reason, sizeof(m->reset_reason), "%s", s->reset_reason);
     m->heap_free = s->heap_free;
+    m->metric = s->temp_metric;
     if (changed) {
         s_dirty = true;
     }

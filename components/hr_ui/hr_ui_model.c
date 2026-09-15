@@ -3,6 +3,7 @@
  * formatting for the dongle display. See hr_ui_model.h.
  */
 #include "hr_ui_model.h"
+#include "hr_temp.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -425,10 +426,9 @@ void hr_ui_fmt_uptime(unsigned long secs, char *out, size_t cap)
 void hr_ui_fmt_temp(long f, bool metric, char *out, size_t cap)
 {
     if (metric) {
-        long num = (f - 32) * 5;
-        /* Round to nearest, away from zero at .5 */
-        long c = (num + (num >= 0 ? 4 : -4)) / 9;
-        snprintf(out, cap, "%ld" HR_UI_DEG "C", c);
+        /* Whole degrees: the huge font has room for "-28°C", not "-27.8°C",
+         * and the same rounding the web UI and MQTT use (hr_temp.h). */
+        snprintf(out, cap, "%ld" HR_UI_DEG "C", hr_temp_f_to_c(f));
     } else {
         snprintf(out, cap, "%ld" HR_UI_DEG "F", f);
     }

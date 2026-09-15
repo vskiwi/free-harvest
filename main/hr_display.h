@@ -46,6 +46,7 @@ typedef struct {
     char fw_version[24];
     char reset_reason[12];
     unsigned heap_free;
+    bool temp_metric;        /* show temperatures in Celsius (hr_units.h) */
 } hr_display_status_t;
 
 /*
