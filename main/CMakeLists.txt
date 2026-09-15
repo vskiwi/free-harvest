@@ -1,4 +1,4 @@
-set(srcs "main.c" "hr_usb.c" "hr_wifi.c" "hr_http.c" "hr_mqtt.c" "hr_log.c" "hr_logring.c" "hr_capture.c" "hr_batchstore.c" "hr_compat.c")
+set(srcs "main.c" "hr_usb.c" "hr_wifi.c" "hr_http.c" "hr_mqtt.c" "hr_log.c" "hr_logring.c" "hr_capture.c" "hr_batchstore.c" "hr_compat.c" "hr_quiesce.c" "hr_reboot.c")
 
 # Board peripherals (T-Dongle-S3). The sources are only compiled when the
 # board is selected, so the DevKitC binary is unchanged. hr_display.c owns
