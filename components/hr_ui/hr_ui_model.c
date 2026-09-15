@@ -189,9 +189,12 @@ hr_ui_screen_t hr_ui_select(hr_ui_state_t *st, const hr_ui_model_t *m,
             st->connecting_since_ms = now_ms;
         } else if (m->wifi == HR_UI_WIFI_CONNECTED &&
                    (st->last_wifi == HR_UI_WIFI_CONNECTING ||
-                    st->last_wifi == HR_UI_WIFI_AP_SETUP)) {
+                    st->last_wifi == HR_UI_WIFI_AP_SETUP ||
+                    st->last_wifi == HR_UI_WIFI_NO_IP)) {
             /* A join we watched happen. Finding the network already up
-             * when the display starts is not news worth ten seconds. */
+             * when the display starts is not news worth ten seconds. An
+             * address regained after a no-IP spell may be a new one, so
+             * it is shown too. */
             st->connected_since_ms = now_ms;
         }
         st->last_wifi = m->wifi;
