@@ -1,5 +1,6 @@
 #include "hr_usb.h"
 #include "hr_capture.h"
+#include "hr_log.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -10,6 +11,7 @@
 #include "tinyusb.h"
 #include "tusb_cdc_acm.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "hr_usb";
@@ -49,6 +51,27 @@ static unsigned long now_ms(void)
     return (unsigned long)(esp_timer_get_time() / 1000);
 }
 
+#if CONFIG_HR_USB_TRACE_RX
+/* First bytes of a chunk, printable as-is and the rest as \xNN. */
+static void trace_rx(const uint8_t *buf, size_t got)
+{
+    enum { SHOW = 32 };
+    char shown[SHOW * 4 + 4];
+    size_t o = 0, lim = got < SHOW ? got : SHOW;
+    for (size_t i = 0; i < lim && o + 5 < sizeof(shown); i++) {
+        if (buf[i] >= 0x20 && buf[i] < 0x7f && buf[i] != '\\') {
+            shown[o++] = (char)buf[i];
+        } else {
+            o += (size_t)snprintf(shown + o, sizeof(shown) - o, "\\x%02x",
+                                  buf[i]);
+        }
+    }
+    shown[o] = '\0';
+    ESP_LOGI(TAG, "RX chunk %u bytes: %s%s", (unsigned)got, shown,
+             got > lim ? "..." : "");
+}
+#endif
+
 static void on_rx(int itf, cdcacm_event_t *event)
 {
     (void)event;
@@ -60,10 +83,97 @@ static void on_rx(int itf, cdcacm_event_t *event)
     while (tinyusb_cdcacm_read(itf, buf, sizeof(buf), &got) == ESP_OK &&
            got > 0) {
         s_rx_bytes += got;
+#if CONFIG_HR_USB_TRACE_RX
+        trace_rx(buf, got);
+#endif
         hr_session_rx(s_session, buf, got, now_ms());
         got = 0;
     }
 }
+
+#if CONFIG_HR_USB_LOG_CDC
+/*
+ * Bench log port: every formatted ESP_LOG line is mirrored onto CDC1.
+ *
+ * Runs on whichever task is logging - the TinyUSB task included, from inside
+ * its own callbacks - so it never waits: if the FIFO has no room (nobody has
+ * the port open, or the reader is slow) the line is dropped and counted, and
+ * the count is reported on the next line that does fit. tud_cdc_n_write is
+ * mutex-protected across tasks. The dryer's CDC0 is untouched.
+ */
+#define LOG_ITF TINYUSB_CDC_ACM_1
+static unsigned s_log_dropped;
+
+static void cdc_log_sink(const char *line, size_t len)
+{
+    if (!s_mounted || !tud_ready()) {
+        s_log_dropped++;
+        return;
+    }
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+        len--;
+    }
+    char note[48];
+    size_t nlen = 0;
+    if (s_log_dropped) {
+        int w = snprintf(note, sizeof(note),
+                         "... %u log lines dropped (port not read)\r\n",
+                         s_log_dropped);
+        nlen = (w > 0 && (size_t)w < sizeof(note)) ? (size_t)w : 0;
+    }
+    if (tud_cdc_n_write_available(LOG_ITF) < nlen + len + 2) {
+        s_log_dropped++;
+        return;
+    }
+    if (nlen) {
+        tud_cdc_n_write(LOG_ITF, note, nlen);
+        s_log_dropped = 0;
+    }
+    tud_cdc_n_write(LOG_ITF, line, len);
+    tud_cdc_n_write(LOG_ITF, "\r\n", 2);
+    tud_cdc_n_write_flush(LOG_ITF);
+}
+
+static void on_log_rx(int itf, cdcacm_event_t *event)
+{
+    (void)event;
+    /* Nothing is read from the log port; drain so the FIFO cannot fill. */
+    uint8_t sink[64];
+    size_t got = 0;
+    while (tinyusb_cdcacm_read(itf, sink, sizeof(sink), &got) == ESP_OK &&
+           got > 0) {
+        got = 0;
+    }
+}
+
+static void on_log_line_state(int itf, cdcacm_event_t *event)
+{
+    (void)itf;
+    ESP_LOGI(TAG, "log port (CDC1) line state: dtr=%d rts=%d",
+             (int)event->line_state_changed_data.dtr,
+             (int)event->line_state_changed_data.rts);
+}
+
+static void log_port_init(void)
+{
+    const tinyusb_config_cdcacm_t log_cfg = {
+        .usb_dev = TINYUSB_USBDEV_0,
+        .cdc_port = LOG_ITF,
+        .rx_unread_buf_sz = 256,
+        .callback_rx = &on_log_rx,
+        .callback_rx_wanted_char = NULL,
+        .callback_line_state_changed = &on_log_line_state,
+        .callback_line_coding_changed = NULL,
+    };
+    if (tusb_cdc_acm_init(&log_cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "CDC1 log port init failed; log stays on UART only");
+        return;
+    }
+    hr_log_set_sink(cdc_log_sink);
+    ESP_LOGW(TAG, "BENCH BUILD: ESP log mirrored to USB CDC1; two serial "
+                  "ports are exposed - do not plug this build into the dryer");
+}
+#endif /* CONFIG_HR_USB_LOG_CDC */
 
 /*
  * TinyUSB bus-event hooks (weak symbols in the TinyUSB core; the MSC driver
@@ -337,6 +447,9 @@ void hr_usb_init(hr_session_t *session)
         .callback_line_coding_changed = &on_line_coding,
     };
     ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
+#if CONFIG_HR_USB_LOG_CDC
+    log_port_init();
+#endif
 
     /* Heap at USB bring-up. hr_capture_init() formats/mounts a 3MB SPIFFS
      * immediately before this, so if that ever starves TinyUSB's DMA buffers
