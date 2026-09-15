@@ -152,7 +152,7 @@ static void title(const char *text, uint16_t fg, uint16_t bg,
 static void readings(const hr_ui_model_t *m, uint16_t fg, uint16_t bg)
 {
     char temp[12], vac[16];
-    hr_ui_fmt_temp(m->tel.temp_f, false, temp, sizeof(temp));
+    hr_ui_fmt_temp(m->tel.temp_f, m->metric, temp, sizeof(temp));
     hr_gfx_fill_rect(0, HR_ZONE_BIG_Y, HR_GFX_W, HR_ZONE_BIG_H, bg);
     int x = hr_gfx_text_huge(X_MARGIN, HR_ZONE_BIG_Y, temp, fg, bg);
 
@@ -386,7 +386,7 @@ static void screen_run(const hr_ui_state_t *st, const hr_ui_model_t *m,
                        HR_UI_C_BLACK);
         hr_gfx_text6x8(4, 51, "dryer's own panel", HR_UI_C_WHITE,
                        HR_UI_C_BLACK);
-        hr_ui_fmt_temp(m->tel.temp_f, false, t, sizeof(t));
+        hr_ui_fmt_temp(m->tel.temp_f, m->metric, t, sizeof(t));
         hr_gfx_text6x8(4, 66, t, HR_UI_C_GREY, HR_UI_C_BLACK);
         if (blink(now_ms, 1000)) {
             hr_gfx_frame(0, HR_ZONE_TITLE_Y, HR_GFX_W, HR_GFX_H - HR_ZONE_TITLE_Y,
@@ -401,7 +401,7 @@ static void screen_run(const hr_ui_state_t *st, const hr_ui_model_t *m,
     if (phase == HR_PHASE_PREPARING) {
         /* Countdown in place of the vacuum - the pump is off anyway. */
         char temp[12];
-        hr_ui_fmt_temp(m->tel.temp_f, false, temp, sizeof(temp));
+        hr_ui_fmt_temp(m->tel.temp_f, m->metric, temp, sizeof(temp));
         hr_gfx_fill_rect(0, HR_ZONE_BIG_Y, HR_GFX_W, HR_ZONE_BIG_H, HR_UI_C_BLACK);
         hr_gfx_text_huge(X_MARGIN, HR_ZONE_BIG_Y, temp, HR_UI_C_WHITE,
                          HR_UI_C_BLACK);

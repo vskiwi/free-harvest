@@ -399,6 +399,9 @@ static void post_display_status(void)
     snprintf(s.reset_reason, sizeof(s.reset_reason), "%s",
              hr_reset_reason_str());
     s.heap_free = (unsigned)esp_get_free_heap_size();
+    /* The screen spells temperatures in the owner's unit (Settings >
+     * Temperature unit); a change shows on the next 250 ms post. */
+    s.temp_metric = hr_units_metric();
 
     hr_display_post_status(&s);
 }
