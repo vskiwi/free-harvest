@@ -258,9 +258,34 @@ default for this board). If your port is on the left, disable
 **Free Harvest Adapter → Rotate the display 180 degrees** in
 `idf.py -B build-tdongle menuconfig`.
 
-**Notes.** The plain T-Dongle-S3 has no PSRAM; the frame buffer (25.6 KB) lives
-in internal RAM. The microSD slot is not used. Pin assignments are in
-`main/board_t_dongle_s3.h`.
+**Bench debug build.** For a stick plugged into a *computer* (never the dryer)
+there is a second overlay that exposes two serial ports - CDC0 is the dryer
+protocol as before, CDC1 carries the ESP log - and logs every raw USB chunk
+before the parser sees it:
+
+```bash
+idf.py -B build-tdongle-debug -D SDKCONFIG=build-tdongle-debug/sdkconfig \
+    -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.t-dongle-s3;sdkconfig.defaults.t-dongle-s3-debug" \
+    set-target esp32s3 build
+idf.py -B build-tdongle-debug -p /dev/cu.usbmodem* flash   # BOOT held while plugging in
+screen /dev/cu.usbmodem*3 115200                          # the second port is the log
+python3 tools/replay_capture.py capture.txt --port /dev/cu.usbmodem*1   # play a recorded dryer into CDC0
+```
+
+Flash the production build (`build-tdongle`) again before the stick goes back
+into the machine: the debug device has a different PID and two interfaces.
+
+**Notes.** The plain T-Dongle-S3 has no PSRAM, and the ESP32-S3 shares one
+SRAM between code kept in IRAM, static data and the heap. The board's
+`sdkconfig.defaults.t-dongle-s3` therefore moves Wi-Fi/PHY/heap code to
+flash, builds with `-Os`, halves the Wi-Fi buffer pools and drops IPv6 and
+WPA-Enterprise - none of which the adapter uses. That gives the heap about
+106 KB more than the first build of this port had (which ran out of memory in
+the field); the expected figure after Wi-Fi, MQTT and the web server are up is
+in the 120-150 KB range, to be confirmed on hardware. The frame buffer
+(25.6 KB) is static. `/api/state` reports `heap_free`, `heap_min` and
+`heap_largest`, and the log carries a heap line once a minute. The microSD
+slot is not used. Pin assignments are in `main/board_t_dongle_s3.h`.
 
 ---
 
