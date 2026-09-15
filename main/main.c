@@ -358,6 +358,12 @@ static void post_display_status(void)
     case HR_WIFI_CONNECTED:
         s.wifi = HR_UI_WIFI_CONNECTED;
         break;
+    case HR_WIFI_NO_IP:
+        /* Associated, no address: hr_wifi is already restarting DHCP and
+         * rejoining (hr_netwatch.h). The screen must not show the stale
+         * 0.0.0.0 as if it were reachable. */
+        s.wifi = HR_UI_WIFI_NO_IP;
+        break;
     default:
         s.wifi = HR_UI_WIFI_NONE;
         break;
