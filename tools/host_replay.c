@@ -382,6 +382,22 @@ int main(int argc, char **argv)
             printf("%9lu  !  %s\n", s_now_ms, l->payload);
         } else if (l->dir == '?' && !s_quiet) {
             printf("%9lu  ?  %s\n", s_now_ms, l->payload);
+        } else if (l->dir == 'e') {
+            /* "enc <len> <frame>": the 6.0.644170 encoded transport. Fed
+             * verbatim and WITHOUT a CR - it has no terminator - split in
+             * two like the plaintext frames, so the framer's length count
+             * is what reassembles it. */
+            const char *frame = strchr(l->payload, ' ');
+            frame = frame ? strchr(frame + 1, ' ') : NULL;
+            if (frame != NULL && frame[1] != '\0') {
+                frame++;
+                if (!s_quiet) {
+                    printf("%9lu  e  %s\n", s_now_ms, l->payload);
+                }
+                size_t len = strlen(frame), half = len / 2;
+                hr_session_rx(&r.session, frame, half, s_now_ms);
+                hr_session_rx(&r.session, frame + half, len - half, s_now_ms);
+            }
         }
         step(&r);
     }
@@ -396,6 +412,12 @@ int main(int argc, char **argv)
            "unknown verbs: %lu\n",
            rx_frames, r.session.stream.frames_ok, r.session.stream.frames_bad,
            r.session.unknown_verbs);
+    if (r.session.stream.enc_frames || r.session.stream.enc_bad) {
+        printf("encoded frames (\")S\" transport): %lu whole, %lu bytes, "
+               "%lu abandoned\n",
+               r.session.stream.enc_frames, r.session.stream.enc_bytes,
+               r.session.stream.enc_bad);
+    }
     printf("frames the session sent: %lu   screen transitions: %u\n",
            s_tx_frames, r.transitions);
     printf("screens visited:");

@@ -8,6 +8,8 @@ A v2 capture (GET /api/capture) records both halves of the conversation:
       dir  >  frame from the dryer        <  frame the adapter sent
            !  adapter event               ?  bytes the parser rejected
            ~  "repeat <dir> <body> xN first..last" run summary
+           e  "enc <len> <frame>": a complete encoded frame from a
+              6.0.644170 dryer (")S" + length transport), no terminator
 
 This tool reads such a file and can
 
@@ -72,7 +74,7 @@ def parse_capture(path):
             cols = raw.split("\t")
             if len(cols) == 4:
                 ms_s, epoch_s, d, payload = cols
-                if d not in "><!?~" or len(d) != 1:
+                if d not in "><!?~e" or len(d) != 1:
                     raise ValueError(f"line {n}: bad dir column {d!r}")
             elif len(cols) == 2:
                 # v1: "<ms>\t<body>"; "~repeat"/"~boot" bodies are summaries
@@ -105,6 +107,21 @@ def verb_of(payload, d):
     if d == ">":
         return payload.split(",", 1)[0]
     return payload.split(" ", 1)[0]
+
+
+def enc_len_of(payload):
+    """Declared length of an 'e' line: 'enc <len> <frame>'."""
+    p = payload.split(" ", 2)
+    try:
+        return int(p[1]) if p[0] == "enc" else 0
+    except (IndexError, ValueError):
+        return 0
+
+
+def enc_frame_of(payload):
+    """The raw frame of an 'e' line, header included, without the prefix."""
+    p = payload.split(" ", 2)
+    return p[2] if len(p) == 3 and p[0] == "enc" else ""
 
 
 def expand_repeats(lines):
@@ -152,6 +169,8 @@ def summarise(header, lines, verbose=False):
         len(l.payload.split(",")) > 1)
     events = [l for l in lines if l.dir == "!"]
     rejects = [l for l in lines if l.dir == "?"]
+    enc_lens = collections.Counter(enc_len_of(l.payload) for l in lines
+                                   if l.dir == "e")
 
     # A clock that goes backwards means a reboot (or several files pasted).
     reboots = 0
@@ -187,6 +206,9 @@ def summarise(header, lines, verbose=False):
     print(f"  ! events         : {counts['!']}")
     print(f"  ? rejected       : {counts['?']}")
     print(f"  ~ repeat runs    : {counts['~']}")
+    if counts['e']:
+        print(f"  e encoded frames : {counts['e']}   by declared length: "
+              + ", ".join(f"{n}x{c}" for n, c in sorted(enc_lens.items())))
     print("dryer verbs : " + ", ".join(f"{v}x{n}" for v, n in rx_verbs.most_common()))
     if tx_verbs:
         print("our verbs   : " + ", ".join(f"{v}x{n}" for v, n in tx_verbs.most_common()))
@@ -243,10 +265,12 @@ def replay(lines, port, speed, baud, timeout_s, max_stall_s=0.0):
     import threading
 
     lines = expand_repeats(lines)
-    rx = [l for l in lines if l.dir == ">"]
+    # Encoded frames ('e') are the dryer's side too; they go out verbatim
+    # and WITHOUT a CR - that transport has no terminator.
+    rx = [l for l in lines if l.dir in ">e"]
     expected_tx = [l for l in lines if l.dir == "<"]
     if not rx:
-        sys.exit("nothing to replay: the capture has no '>' lines")
+        sys.exit("nothing to replay: the capture has no '>' or 'e' lines")
 
     WRITE_TIMEOUT = 1.0
     ser = serial.serial_for_url(port, baudrate=baud, timeout=0.05,
@@ -295,7 +319,10 @@ def replay(lines, port, speed, baud, timeout_s, max_stall_s=0.0):
         wait = due - (time.time() - t_wall0)
         if wait > 0:
             time.sleep(wait)
-        raw = l.payload.encode("ascii", "replace") + CR
+        if l.dir == "e":
+            raw = enc_frame_of(l.payload).encode("ascii", "replace")
+        else:
+            raw = l.payload.encode("ascii", "replace") + CR
         t_w = time.time()
         while True:
             try:
