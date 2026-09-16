@@ -1,0 +1,100 @@
+# hr-capture v2 fw=1.0.8 reason=poweron mac=f412fa44a1d8 columns=ms,epoch,dir,payload
+# Excerpt of bench/2026-09-15-dryer-2 (real 6.0.644170 dryer) re-expressed with the
+# framer: complete 20/36-char encoded frames as "e" records. Plaintext lines are real.
+208588	-	!	usb dtr=1 rts=1
+208591	-	!	usb linecoding 9600 8N0
+208594	-	!	usb linecoding 9600 8N0
+208600	-	!	usb linecoding 9600 8N0
+208606	-	!	usb linecoding 9600 8N0
+208613	-	!	usb linecoding 115200 8N0
+208619	-	!	usb linecoding 115200 8N0
+208626	-	!	usb linecoding 115200 8N0
+208632	-	!	usb linecoding 115200 8N0
+213647	-	!	usb dtr=0 rts=0
+200641	1789469230	>	REQINFO,
+200643	1789469230	<	WIFIINFO 5 0 "rst" 1 HR_f412fa44a1d8 0 1 200
+210628	1789469240	>	REQINFO,
+210630	1789469240	<	WIFIINFO 5 0 "rst" 1 HR_f412fa44a1d8 0 1 210
+212618	1789469242	<	STATE 5 0
+220639	1789469250	>	REQINFO,
+220641	1789469250	<	WIFIINFO 5 0 "rst" 1 HR_f412fa44a1d8 0 1 220
+227772	1789469257	<	STATE 5 0
+230609	1789469260	>	REQINFO,
+230610	1789469260	<	WIFIINFO 5 0 "rst" 1 HR_f412fa44a1d8 0 1 230
+240620	1789469270	>	REQINFO,
+240621	1789469270	<	WIFIINFO 5 0 "rst" 1 HR_f412fa44a1d8 0 1 240
+242904	1789469272	<	STATE 5 0
+250630	1789469280	>	REQINFO,
+250632	1789469280	<	WIFIINFO 5 0 "rst" 1 HR_f412fa44a1d8 0 1 250
+258026	1789469287	<	STATE 5 0
+202660	-	<	STATE 5 0
+207891	-	>	REQINFO,
+207892	-	<	WIFIINFO 5 0 "rst" 1 HR_f412fa44a1d8 0 1 207
+217224	-	<	STATE 5 0
+217234	-	<	UNIQUE lH
+217299	-	<	FDNAME
+217301	-	<	REQCFG
+217363	-	<	STATUS
+232484	-	<	STATE 5 0
+232486	-	<	FDNAME
+232571	-	<	REQCFG
+232573	-	<	STATUS
+237888	-	e	enc 36 )S#GSIY84F/ObJG2E6:MW\QO^]H'bJB5@M!!
+241926	-	e	enc 20 )S#7':CP`QB*MBJKUZab
+247648	-	<	STATE 5 0
+247649	-	<	FDNAME
+247674	-	<	REQCFG
+247714	-	<	STATUS
+253077	-	!	link down
+256929	-	e	enc 36 )S#GQK[@WKWSOO`<9CX;KJ^[;85#@bG(FT!!
+271928	-	e	enc 20 )S#7*D$@26;4:U3QD8E-
+286974	-	e	enc 20 )S#7,[+,H?G05G3HDa>?
+286974	-	e	enc 20 )S#7,A`(S)22PF0IMKD-
+301990	-	e	enc 20 )S#7.?^,72MTJJ\5JEW7
+317007	-	e	enc 20 )S#7-MFPQ]??)&V97Z`:
+332023	-	e	enc 20 )S#7/K?H^XO:ZZ=T&G[^
+347031	-	e	enc 20 )S#7XVJ<JBN3=8K.T^I\
+362047	-	e	enc 20 )S#7WK%`LWS`D[>bGV>G
+377064	-	e	enc 20 )S#7Yb-,6\;F_P4:NO<*
+392080	-	e	enc 20 )S#7[`',a`?PF\6.]OQ4
+407099	-	e	enc 20 )S#7[-Q`NMNZ@]O*922Z
+422115	-	e	enc 20 )S#7]+N\\G+*HZJ_5JF3
+437132	-	e	enc 20 )S#7\968O&:A>0ATI2-4
+452147	-	e	enc 20 )S#7^7000/.AP)>\>*&E
+467167	-	e	enc 20 )S#7`N:\^660KULQ`X:6
+482183	-	e	enc 20 )S#7_BT82M^<XWDKSW7_
+497200	-	e	enc 20 )S#7aY],BU#G[MA^P3D+
+512215	-	e	enc 20 )S#7#WW,]XJS53;>MF`[
+527235	-	e	enc 20 )S#7#%AH@F?77a#E`O:@
+542251	-	e	enc 20 )S#7>/;<C(31ZNRE\'*5
+557268	-	e	enc 20 )S#7==%`=C>C:;_a?<Q8
+576898	-	e	enc 20 )S#7>aTX.>4M_5\78OK/
+596936	-	e	enc 20 )S#7C6W,-M;\`S>+XK\.
+611952	-	e	enc 20 )S#7B+38P%%1ELbD\%>H
+626968	-	e	enc 20 )S#7DB;\(/K#^(7X&02Z
+641986	-	e	enc 20 )S#7F@:\W*>C5%OKAO@P
+657868	-	e	enc 20 )S#7EMb(GS[C(GR\6J`?
+662913	-	e	enc 20 )S#7H%),N,WQ&CQ:IV(<
+677858	-	e	enc 20 )S#7G2O@,HWJ_V()SPJ-
+687876	-	e	enc 20 )S#7FYDP48/UOWD44`\(
+693236	-	e	enc 20 )S#7I0M<RKZ*AXX8TL\0
+707869	-	e	enc 20 )S#7H>3X%,;#-.Ha&/;E
+717864	-	e	enc 20 )S#71bH<.U,];&^M.DEM
+727859	-	e	enc 20 )S#710/0CEHI4W?[`9A&
+733913	-	e	enc 20 )S#73G8<Y^@2<]_JE.2Q
+747872	-	e	enc 20 )S#72T`(T9JCN4]3*,;P
+757871	-	e	enc 20 )S#72;VXP%DTQK(_47E>
+763949	-	e	enc 20 )S#74R\,T4Q_1;6+(7B<
+777861	-	e	enc 20 )S#73`CP^bY=O`@8a.NV
+780888	-	e	enc 20 )S#76PZ,35`?<>6&\[0B
+795903	-	e	enc 20 )S#75E48SWS0T(?AC.9X
+807869	-	e	enc 20 )S#77\;\[^$F2WG\W@ZA
+810920	-	e	enc 20 )S#77C20@Z^TZADJD2^G
+825940	-	e	enc 20 )S#79Z8\2XS>?'M:N\,H
+837858	-	e	enc 20 )S#79'_(QG,ZES_4K@:Z
+840957	-	e	enc 20 )S#78NV85A'C=A.XT\;%
+855974	-	e	enc 20 )S#7;%],1PS>T=2BIA\'
+867866	-	e	enc 20 )S#7:3FPN.8R,P<DMF]1
+873227	-	e	enc 20 )S#7<JL<T<Q?I=55.B2X
+887860	-	e	enc 20 )S#7;X3XHZN^a^`+LYC<
+889878	-	e	enc 20 )S#73$I<)JV(EaaS.3,K

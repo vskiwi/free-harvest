@@ -50,11 +50,11 @@ static esp_timer_handle_t s_ap_timeout_timer;
 static esp_timer_handle_t s_sta_retry_timer;
 static esp_timer_handle_t s_noip_poll_timer;
 static bool s_ap_window_expired; /* true once the 5-min window has closed */
+static int64_t s_ap_opened_us;   /* when the current window was armed */
 static volatile bool s_restarting; /* hr_wifi_prepare_restart() was called */
 static hr_netwatch_t s_netwatch;
 /* The next STA_DISCONNECTED is one we asked for to get an address back. */
 static volatile bool s_noip_rejoin_pending;
-static int64_t s_ap_opened_us;   /* when the current window was armed */
 
 static wifi_ap_record_t s_scan[MAX_SCAN];
 static uint16_t s_scan_count;
