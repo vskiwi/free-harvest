@@ -566,8 +566,9 @@
         <button type="button" data-unit="f">°F</button>
         <button type="button" data-unit="c">°C</button>
       </div>
-      <div class="hint">For this browser. Recipe temperatures stay in °F, the
-        unit the dryer takes them in, and Home Assistant follows its own unit
+      <div class="hint">For this browser, and for the adapter's own screen on
+        boards that have one. Recipe temperatures stay in °F, the unit the
+        dryer takes them in, and Home Assistant follows its own unit
         setting.</div>
     </div>
 
@@ -1116,7 +1117,11 @@ function note(el,msg,kind){ el.className="notice "+(kind||"info"); el.innerHTML=
    conversion happens here at the last moment. Recipe setpoints stay in F: they
    go TO the dryer, in its own unit. */
 let tempC=false;
-try{ tempC = localStorage.getItem("fh-unit")==="c"; }catch(e){ /* blocked: F */ }
+/* null until this browser has chosen; then it follows the adapter's screen
+   setting once (see the unit segment below). */
+let unitChosen=null;
+try{ unitChosen = localStorage.getItem("fh-unit"); }catch(e){ /* blocked: F */ }
+tempC = unitChosen==="c";
 function tempSym(){ return tempC ? "°C" : "°F"; }
 /* Degrees F -> the display unit, as a number (the chart scales from it). */
 function toUnit(f){ return tempC ? (f-32)*5/9 : f; }
@@ -2778,13 +2783,31 @@ function applyUnit(){
   $("#m-temp-u").textContent=" "+tempSym();
 }
 applyUnit();
-$$("#unitseg button").forEach(b=>b.addEventListener("click",()=>{
-  tempC = b.dataset.unit==="c";
-  try{ localStorage.setItem("fh-unit", b.dataset.unit); }catch(e){ /* this visit only */ }
+function repaintUnit(){
   applyUnit();
   if(lastState) paintDash(lastState);
   refreshTrend();
   refreshLogbook();
+}
+/* The adapter's own screen (T-Dongle-S3) cannot read this browser's choice,
+   so it keeps a unit of its own in NVS (/api/units, PIN-gated like the other
+   adapter settings). A tap here sets both; a browser that has not chosen yet
+   starts from what the screen shows. /api/state and MQTT stay in F either
+   way - only presentation changes. */
+if(unitChosen===null){
+  fetch("/api/units").then(r=>r.json()).then(j=>{
+    if(j && (j.temp_pref==="c" || j.temp_pref==="f") && unitChosen===null){
+      tempC = j.temp_pref==="c";
+      repaintUnit();
+    }
+  }).catch(()=>{ /* no such endpoint or unreachable: keep F */ });
+}
+$$("#unitseg button").forEach(b=>b.addEventListener("click",()=>{
+  tempC = b.dataset.unit==="c";
+  unitChosen = b.dataset.unit;
+  try{ localStorage.setItem("fh-unit", b.dataset.unit); }catch(e){ /* this visit only */ }
+  repaintUnit();
+  ctrlPost("/api/units", "temp_unit="+b.dataset.unit).catch(()=>{ /* screen keeps its unit */ });
 }));
 
 /* Remote-control master switch. A two-state segmented control rather than a
