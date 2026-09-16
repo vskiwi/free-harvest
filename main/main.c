@@ -17,6 +17,7 @@
 #if CONFIG_HR_BATCH_HISTORY
 #include "hr_dryerfiles.h"
 #endif
+#include "hr_units.h"
 #include "hr_encring.h"
 #include "hr_enc.h"
 #include "hr_http.h"
@@ -509,6 +510,10 @@ void app_main(void)
      * meets a framer that can hold one. */
     hr_dryerfiles_init(&s_session);
 #endif
+    /* Temperature unit for the adapter's own display (/api/units); NVS-backed,
+     * presentation only - the dryer keeps sending F and so do /api/state and
+     * MQTT. Read in post_display_status() on boards with a screen. */
+    hr_units_init();
 
     hr_usb_init(&s_session);
 

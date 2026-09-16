@@ -1,6 +1,6 @@
 set(srcs "main.c" "hr_usb.c" "hr_wifi.c" "hr_http.c" "hr_mqtt.c"
         "hr_log.c" "hr_logring.c" "hr_capture.c" "hr_batchstore.c"
-        "hr_compat.c" "hr_quiesce.c" "hr_reboot.c" "hr_netwatch.c")
+        "hr_compat.c" "hr_units.c" "hr_quiesce.c" "hr_reboot.c" "hr_netwatch.c")
 # Reading the dryer's own batch logs - see hr_dryerfiles.h.
 if(CONFIG_HR_BATCH_HISTORY)
     list(APPEND srcs "hr_dryerfiles.c")
