@@ -208,6 +208,9 @@ temperature, vacuum, progress bar, batch time and ETA; **COMPLETE**; and an
 button dismisses. The LED mirrors the phase colour — blue freezing, orange
 drying, red-orange final dry, green complete — blinking or breathing when
 something wants attention, and brightens briefly on every frame from the dryer.
+Temperatures on the screen are in °F or °C: the stick keeps that choice itself
+(`GET/POST /api/units`, `temp_unit=f|c`, stored in NVS), and the web page's
+Settings → Temperature unit sets both the page and the screen together.
 
 **The button never controls the dryer.** A short press dismisses an alert, or
 cycles the main screen → an *info* page (IP, SSID and signal, MQTT, capture use,
