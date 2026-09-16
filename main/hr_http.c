@@ -11,6 +11,7 @@
 #include "hr_usb.h"
 #include "hr_wifi.h"
 #include "hr_compat.h"
+#include "hr_units.h"
 
 #include "esp_app_desc.h"
 #include "esp_app_format.h"
@@ -1422,6 +1423,69 @@ static esp_err_t h_compat_post(httpd_req_t *req)
                      "{\"ok\":true,\"compat644170\":%s,\"stored\":%s}",
                      on ? "true" : "false", stored ? "true" : "false");
     return send_json(req, out, (size_t)n);
+}
+
+/*
+ * GET  /api/units                  -> {"temp_unit":"F","temp_pref":"f"}
+ * POST /api/units  temp_unit=f|c   (also accepts "fahrenheit"/"celsius",
+ *                                   "imperial"/"metric", "auto")
+ *
+ * The temperature unit the ADAPTER's own display spells temperatures in (the
+ * T-Dongle-S3 screen). Stored in NVS. The web page keeps its own per-browser
+ * unit (Settings > Temperature unit, localStorage) and mirrors a change here
+ * so the screen follows; /api/state and MQTT stay in the dryer's degrees F,
+ * as upstream serves them. The dryer is not involved - it sends F regardless
+ * and is told nothing - so this is a pure presentation setting and carries
+ * the same PIN gate as the other adapter settings, no more.
+ */
+static size_t units_json(char *out, size_t cap, bool ok, bool stored)
+{
+    return (size_t)snprintf(out, cap,
+                            "{\"ok\":%s,\"temp_unit\":\"%s\","
+                            "\"temp_pref\":\"%s\",\"stored\":%s}",
+                            ok ? "true" : "false",
+                            hr_temp_unit_letter(hr_units_temp()),
+                            hr_temp_pref_str(hr_units_pref()),
+                            stored ? "true" : "false");
+}
+
+static esp_err_t h_units_get(httpd_req_t *req)
+{
+    char out[96];
+    size_t n = units_json(out, sizeof(out), true, true);
+    return send_json(req, out, n);
+}
+
+static esp_err_t h_units_post(httpd_req_t *req)
+{
+    char buf[96];
+    int got = read_form(req, buf, sizeof(buf));
+    if (got < 0) {
+        return httpd_resp_send_500(req);
+    }
+
+    if (!pin_guard(req, buf)) {
+        return ESP_OK;
+    }
+
+    char v[16] = {0};
+    if (httpd_query_key_value(buf, "temp_unit", v, sizeof(v)) != ESP_OK &&
+        httpd_query_key_value(buf, "units", v, sizeof(v)) != ESP_OK) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(
+            req, "{\"ok\":false,\"reason\":\"temp_unit=f|c required\"}");
+    }
+    hr_temp_pref_t pref;
+    if (!hr_temp_pref_parse(v, &pref)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(
+            req, "{\"ok\":false,\"reason\":\"temp_unit must be f or c\"}");
+    }
+    bool stored = hr_units_set_pref(pref);
+
+    char out[96];
+    size_t n = units_json(out, sizeof(out), true, stored);
+    return send_json(req, out, n);
 }
 
 /*
@@ -2867,6 +2931,8 @@ void hr_http_start(hr_session_t *session, hr_history_t *history)
     reg("/api/wififlags", HTTP_POST, h_wififlags);
     reg("/api/compat", HTTP_GET, h_compat_get);
     reg("/api/compat", HTTP_POST, h_compat_post);
+    reg("/api/units", HTTP_GET, h_units_get);
+    reg("/api/units", HTTP_POST, h_units_post);
     reg("/api/dryer/reboot", HTTP_POST, h_dryer_reboot);
     reg("/img/*", HTTP_GET, h_img);
     /* Captive-portal probes (Android/Apple/Windows). */
