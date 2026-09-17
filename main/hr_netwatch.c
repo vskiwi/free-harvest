@@ -6,6 +6,7 @@
 #include <string.h>
 
 #define DEFAULT_GRACE_MS         (5u * 1000u)
+#define DEFAULT_FIRST_GRACE_MS   (12u * 1000u)
 #define DEFAULT_DHCP_RESTART_MS  (15u * 1000u)
 #define DEFAULT_RECONNECT_MS     (45u * 1000u)
 #define DEFAULT_RECONNECT_MAX_MS (6u * 60u * 1000u)
@@ -24,6 +25,21 @@ void hr_netwatch_init(hr_netwatch_t *w, const hr_netwatch_cfg_t *cfg)
     }
     if (w->cfg.dhcp_restart_ms == 0) {
         w->cfg.dhcp_restart_ms = DEFAULT_DHCP_RESTART_MS;
+    }
+    if (w->cfg.first_grace_ms == 0) {
+        w->cfg.first_grace_ms = DEFAULT_FIRST_GRACE_MS;
+    }
+    /*
+     * The first grace must never outlast the DHCP restart: the point of the
+     * status flipping is to precede the remedies, not to follow them. Nor
+     * may it be shorter than the ordinary grace - a fresh join is the slow
+     * case, not the fast one.
+     */
+    if (w->cfg.first_grace_ms > w->cfg.dhcp_restart_ms) {
+        w->cfg.first_grace_ms = w->cfg.dhcp_restart_ms;
+    }
+    if (w->cfg.first_grace_ms < w->cfg.grace_ms) {
+        w->cfg.first_grace_ms = w->cfg.grace_ms;
     }
     if (w->cfg.reconnect_ms == 0) {
         w->cfg.reconnect_ms = DEFAULT_RECONNECT_MS;
@@ -66,7 +82,13 @@ void hr_netwatch_on_assoc(hr_netwatch_t *w, uint32_t now_ms)
     /* The DHCP clock starts at association: a join that never yields an
      * address is the same problem as a lease that was lost. The back-off
      * count is kept - a rejoin is what got us here. */
+    w->first_ip_pending = true;
     begin_episode(w, now_ms);
+}
+
+uint32_t hr_netwatch_grace_ms(const hr_netwatch_t *w)
+{
+    return w->first_ip_pending ? w->cfg.first_grace_ms : w->cfg.grace_ms;
 }
 
 void hr_netwatch_on_disassoc(hr_netwatch_t *w, uint32_t now_ms)
@@ -99,6 +121,7 @@ hr_netwatch_action_t hr_netwatch_tick(hr_netwatch_t *w, bool have_ip,
     }
     if (have_ip) {
         w->have_ip = true;
+        w->first_ip_pending = false;
         w->backoff_n = 0; /* the network answered; start clean next time */
         end_episode(w);
         return HR_NETWATCH_NONE;
@@ -110,7 +133,7 @@ hr_netwatch_action_t hr_netwatch_tick(hr_netwatch_t *w, bool have_ip,
         begin_episode(w, now_ms);
     }
     uint32_t elapsed = now_ms - w->noip_since_ms;
-    if (!w->reported && elapsed >= w->cfg.grace_ms) {
+    if (!w->reported && elapsed >= hr_netwatch_grace_ms(w)) {
         w->reported = true;
         w->episodes++;
     }
@@ -152,7 +175,7 @@ hr_netwatch_action_t hr_netwatch_tick(hr_netwatch_t *w, bool have_ip,
 bool hr_netwatch_no_ip(const hr_netwatch_t *w, uint32_t now_ms)
 {
     return w->associated && !w->have_ip && w->in_episode &&
-           (now_ms - w->noip_since_ms) >= w->cfg.grace_ms;
+           (now_ms - w->noip_since_ms) >= hr_netwatch_grace_ms(w);
 }
 
 uint32_t hr_netwatch_noip_for_ms(const hr_netwatch_t *w, uint32_t now_ms)

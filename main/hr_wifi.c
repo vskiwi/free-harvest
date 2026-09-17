@@ -45,6 +45,13 @@ static const char *TAG = "hr_wifi";
 #define NOIP_POLL_US (2 * 1000000ULL)
 #define NOIP_GRACE_MS 5000u
 /*
+ * The first address after a join gets longer: DHCP from scratch on a weak
+ * link has been seen to take 8 s (RSSI -97 dBm), and a renewal that is
+ * merely slow is a different thing from a lease that was lost. Kept under
+ * the 15 s DHCP restart so the status still flips before the remedies.
+ */
+#define NOIP_FIRST_GRACE_MS 12000u
+/*
  * Gateway probe (hr_netwatch.h): an ARP request every CONFIG_HR_WIFI_GW_PROBE_S
  * while an address is held, checked for an answer on the next 2 s poll.
  */
@@ -488,6 +495,7 @@ static void start_noip_poll(void)
 {
     hr_netwatch_cfg_t cfg = {
         .grace_ms = NOIP_GRACE_MS,
+        .first_grace_ms = NOIP_FIRST_GRACE_MS,
         .dhcp_restart_ms = (uint32_t)CONFIG_HR_WIFI_NOIP_DHCP_RESTART_S * 1000u,
         .reconnect_ms = (uint32_t)CONFIG_HR_WIFI_NOIP_RECONNECT_S * 1000u,
         .reconnect_max_ms = (uint32_t)CONFIG_HR_WIFI_NOIP_RECONNECT_MAX_S * 1000u,
