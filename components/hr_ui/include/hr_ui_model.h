@@ -59,6 +59,8 @@ typedef struct {
     long phase_elapsed_s;
     long phase_pct;          /* 0..100, -1 when the phase has none */
     long prep_remaining_s;   /* type 17 countdown */
+    long purge_remaining_s;  /* type 8: pump purge seconds left, 0 = not started */
+    bool purge_pump_on;      /* type 8: the oil-free pump is venting right now */
     long freeze_eta_s;       /* -1 when unknown */
     char mode[16];
     char last_stat[HR_UI_RAW_MAX];
@@ -133,7 +135,7 @@ typedef enum {
     HR_UI_ALERT_RESET,       /* panic / brownout, first 60 s after boot */
     HR_UI_ALERT_BAD_FRAMES,  /* parser rejects grew in the last minute */
     HR_UI_ALERT_CAPTURE_DROP,/* capture queue overflowed in the last minute */
-    HR_UI_ALERT_UNKNOWN_SCREEN, /* STAT type never seen before (44) */
+    HR_UI_ALERT_UNKNOWN_SCREEN, /* STAT type with no known layout (e.g. 3, 36) */
 } hr_ui_alert_t;
 
 typedef enum {

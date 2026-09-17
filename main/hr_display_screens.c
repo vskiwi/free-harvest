@@ -411,6 +411,46 @@ static void screen_run(const hr_ui_state_t *st, const hr_ui_model_t *m,
         return;
     }
 
+    if (phase == HR_PHASE_PUMP_PURGE) {
+        /*
+         * Pre-defrost: the dryer vents its oil-free pump for five minutes
+         * before defrosting. The batch is over, so the phase clock in the
+         * title and the "batch" footer would only mislead; the pump's own
+         * countdown takes the countdown slot the prep screen uses.
+         */
+        char temp[12];
+        const long left = m->tel.purge_remaining_s > 0
+                              ? m->tel.purge_remaining_s : 0;
+        title(hr_ui_phase_label_short(phase), pc, HR_UI_C_BLACK,
+              m->tel.purge_pump_on ? "pump on" : "pump off");
+        hr_ui_fmt_temp(m->tel.temp_f, m->metric, temp, sizeof(temp));
+        hr_gfx_fill_rect(0, HR_ZONE_BIG_Y, HR_GFX_W, HR_ZONE_BIG_H, HR_UI_C_BLACK);
+        hr_gfx_text_huge(X_MARGIN, HR_ZONE_BIG_Y, temp, HR_UI_C_WHITE,
+                         HR_UI_C_BLACK);
+        hr_ui_fmt_mmss((unsigned long)left, t, sizeof(t));
+        if (hr_gfx_text_width(temp, 3) + 6 + hr_gfx_text_width(t, 3) <=
+            HR_GFX_W - X_MARGIN * 2) {
+            hr_gfx_text_right(X_RIGHT, HR_ZONE_BIG_Y, t, 3, pc, HR_UI_C_BLACK);
+        } else {
+            hr_gfx_text_right(X_RIGHT, HR_ZONE_BIG_Y + 4, t, 2, pc,
+                              HR_UI_C_BLACK);
+        }
+        if (m->tel.purge_pump_on) {
+            /* The run is 300 s (the dryer's "Pump will run for 5 minutes"). */
+            progress_pct((int)((300 - (left > 300 ? 300 : left)) * 100 / 300),
+                         pc, "venting");
+        } else {
+            progress_clear(HR_UI_C_BLACK);
+        }
+        footer_clear(HR_UI_C_BLACK);
+        /* 26 columns of 6 px fit the 160 px line, like the other footers. */
+        hr_gfx_text6x8(X_MARGIN, Y_FOOT1, "pump purge before defrost",
+                       HR_UI_C_WHITE, HR_UI_C_BLACK);
+        hr_gfx_text6x8(X_MARGIN, Y_FOOT2, "defrost time: dryer panel",
+                       HR_UI_C_GREY, HR_UI_C_BLACK);
+        return;
+    }
+
     hr_ui_fmt_hm((unsigned long)m->tel.phase_elapsed_s, t, sizeof(t));
     title(hr_ui_phase_label_short(phase), pc, HR_UI_C_BLACK, t);
 

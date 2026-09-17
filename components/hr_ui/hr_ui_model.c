@@ -53,7 +53,9 @@ static bool stat_type_known(int type)
 {
     switch (type) {
     case 1: case 2: case 4: case 5: case 6: case 7:
+    case 8: case 9: case 10:  /* pre-defrost (pump purge), defrost, done */
     case 15: case 17: case 31: case 43:
+    case 44:                  /* type-6 variant at the final-dry handover */
         return true;
     default:
         return false;
@@ -77,8 +79,12 @@ static hr_ui_screen_t main_screen(const hr_ui_model_t *m)
     case HR_PHASE_IDLE:
     case HR_PHASE_RECIPE:
     case HR_PHASE_UNKNOWN:
+    case HR_PHASE_DEFROST_DONE: /* nothing left to watch; READY-style */
         return HR_UI_SCREEN_IDLE;
     default:
+        /* Includes PUMP_PURGE and DEFROST: not batch phases (phase_is_run
+         * says so), but the machine is doing something with a countdown,
+         * and the RUN layout is the one with room for it. */
         return HR_UI_SCREEN_RUN;
     }
 }
@@ -466,6 +472,9 @@ const char *hr_ui_phase_label_short(hr_phase_t p)
     case HR_PHASE_COMPLETE:    return "COMPLETE";
     case HR_PHASE_DIAGNOSTICS: return "DIAGNOSTICS";
     case HR_PHASE_RECIPE:      return "RECIPE";
+    case HR_PHASE_PUMP_PURGE:  return "PUMP PURGE";
+    case HR_PHASE_DEFROST:     return "DEFROST";
+    case HR_PHASE_DEFROST_DONE: return "DEFROSTED";
     default:                   return "---";
     }
 }
@@ -481,6 +490,9 @@ uint16_t hr_ui_phase_color(hr_phase_t p)
     case HR_PHASE_IDLE:       return HR_UI_C_IDLE;
     case HR_PHASE_RUNNING:    return HR_UI_C_PREP;
     case HR_PHASE_TRANSITION: return HR_UI_C_YELLOW;
+    /* Maintenance after a batch: same yellow as "waiting for a human". */
+    case HR_PHASE_PUMP_PURGE:
+    case HR_PHASE_DEFROST:    return HR_UI_C_YELLOW;
     default:                  return HR_UI_C_GREY;
     }
 }
@@ -495,7 +507,9 @@ void hr_ui_phase_rgb(hr_phase_t p, uint8_t *r, uint8_t *g, uint8_t *b)
     case HR_PHASE_FINAL_DRY:  *r = 0xFF; *g = 0x50; *b = 0x20; break;
     case HR_PHASE_COMPLETE:   *r = 0x30; *g = 0xE0; *b = 0x60; break;
     case HR_PHASE_IDLE:       *r = 0x60; *g = 0xA0; *b = 0x80; break;
-    case HR_PHASE_TRANSITION: *r = 0xFF; *g = 0xD0; *b = 0x20; break;
+    case HR_PHASE_TRANSITION:
+    case HR_PHASE_PUMP_PURGE:
+    case HR_PHASE_DEFROST:    *r = 0xFF; *g = 0xD0; *b = 0x20; break;
     default:                  *r = 0x80; *g = 0x80; *b = 0x80; break;
     }
 }

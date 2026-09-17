@@ -250,8 +250,9 @@ static void test_alert_priority_and_kinds(void)
     CHECK_INT(st.dismissed, HR_UI_ALERT_NONE);
     m.heap_free = 150000;
 
-    /* Unknown STAT type, soft warning. */
-    m.tel.type = 44;
+    /* Unknown STAT type, soft warning. 36 is the dryer's EndProcessOption
+     * screen, which sends no per-screen fields and has never been seen. */
+    m.tel.type = 36;
     CHECK_INT(hr_ui_select(&st, &m, 300000), HR_UI_SCREEN_ALERT);
     CHECK_INT(st.alert, HR_UI_ALERT_UNKNOWN_SCREEN);
     m.tel.type = 1;
@@ -471,9 +472,85 @@ static void test_format_helpers(void)
     CHECK_INT(HR_RGB565(0, 0, 0xFF), 0x001F);
 
     /* Labels fit the 16 px title line: 13 columns at 12 px per glyph. */
-    for (int p = HR_PHASE_UNKNOWN; p <= HR_PHASE_COMPLETE; p++) {
+    for (int p = HR_PHASE_UNKNOWN; p <= HR_PHASE_DEFROST_DONE; p++) {
         CHECK(strlen(hr_ui_phase_label_short((hr_phase_t)p)) <= 13);
     }
+    CHECK_STR(hr_ui_phase_label_short(HR_PHASE_PUMP_PURGE), "PUMP PURGE");
+}
+
+/* ------------------------------------------------------------------ */
+/* STAT type 8: pump purge before a defrost (real 2026-09-17 frames)   */
+/* ------------------------------------------------------------------ */
+
+/* Fill the model's telemetry the way hr_display_post_telemetry does. */
+static void post_frame(hr_ui_model_t *m, const char *line)
+{
+    hr_frame_t f;
+    hr_telemetry_t t;
+    CHECK(hr_frame_parse(line, &f));
+    CHECK(hr_telemetry_from_stat(&f, &t));
+    m->link_up = true;
+    m->usb_mounted = true;
+    m->tel.valid = true;
+    m->tel.type = t.type;
+    m->tel.phase = hr_phase_of(&t);
+    m->tel.temp_f = t.temperature_f;
+    m->tel.pressure_valid = t.pressure_valid;
+    m->tel.vacuum_um = t.pressure_microns;
+    m->tel.batch_elapsed_s = t.batch_elapsed_s;
+    m->tel.phase_elapsed_s = t.phase_elapsed_s;
+    m->tel.phase_pct = -1;
+    m->tel.prep_remaining_s = t.prep_active ? t.prep_remaining_s : 0;
+    m->tel.purge_remaining_s = t.purge_active ? t.purge_remaining_s : 0;
+    m->tel.purge_pump_on = t.purge_active && t.purge_pump_on;
+}
+
+static void test_pump_purge_screen(void)
+{
+    TEST_CASE("type 8 shows the RUN layout as PUMP PURGE, no alert, not a run");
+    hr_ui_model_t m;
+    hr_ui_state_t st;
+    fresh(&m, &st);
+    m.wifi = HR_UI_WIFI_CONNECTED;
+
+    /* Complete -> DEFROST pressed: the screen is up, pump not started yet. */
+    post_frame(&m, "STAT,7,0,0,0,41,46040,139303,92830,48,312,0,0,90,Auto,,\r");
+    CHECK_INT(hr_ui_select(&st, &m, 100000), HR_UI_SCREEN_COMPLETE);
+    post_frame(&m, "STAT,8,0,0,0,41,46221,159616,92830,50,3,0,7200,,\r");
+    CHECK_INT(m.tel.phase, HR_PHASE_PUMP_PURGE);
+    CHECK_INT(hr_ui_select(&st, &m, 115000), HR_UI_SCREEN_RUN);
+    CHECK_INT(st.alert, HR_UI_ALERT_NONE);   /* known screen: no "never seen" */
+    CHECK(!m.tel.purge_pump_on);
+    CHECK_INT(m.tel.purge_remaining_s, 0);
+
+    /* Pump running, 300 s countdown. */
+    post_frame(&m, "STAT,8,0,0,0,40,45735,159639,92830,50,7,300,7200,,\r");
+    CHECK_INT(hr_ui_select(&st, &m, 130000), HR_UI_SCREEN_RUN);
+    CHECK(m.tel.purge_pump_on);
+    CHECK_INT(m.tel.purge_remaining_s, 300);
+    hr_ui_led_t led = hr_ui_led_for(HR_UI_SCREEN_RUN, &m, 130000);
+    CHECK_INT(led.pattern, HR_UI_LED_SOLID);
+    CHECK_INT(hr_ui_phase_color(HR_PHASE_PUMP_PURGE), HR_UI_C_YELLOW);
+
+    /* Silence right after a purge is NOT "link lost mid-batch": the purge
+     * never counted as a run, so a dark dryer is just NO_DRYER. */
+    post_frame(&m, "STAT,8,0,0,0,36,39793,159927,92830,50,7,12,7200,,\r");
+    CHECK_INT(hr_ui_select(&st, &m, 430000), HR_UI_SCREEN_RUN);
+    m.link_up = false;
+    CHECK_INT(hr_ui_select(&st, &m, 480000), HR_UI_SCREEN_NO_DRYER);
+    CHECK_INT(st.alert, HR_UI_ALERT_NONE);
+
+    /* Back to Ready when the dryer returns. */
+    post_frame(&m, "STAT,1,0,0,0,36,38215,159939,92830,38,1,1,Auto,v6.5,,\r");
+    m.tel.phase = HR_PHASE_IDLE; /* tracker: counter stopped => idle */
+    CHECK_INT(hr_ui_select(&st, &m, 500000), HR_UI_SCREEN_IDLE);
+    CHECK_INT(m.tel.purge_remaining_s, 0);
+
+    /* The one-frame type-44 variant of final dry is known too. */
+    post_frame(&m, "STAT,44,0,0,0,120,282,132103,92830,47,Auto,1,99,0,0,7,2,0,31370,,\r");
+    CHECK_INT(m.tel.phase, HR_PHASE_FINAL_DRY);
+    CHECK_INT(hr_ui_select(&st, &m, 510000), HR_UI_SCREEN_RUN);
+    CHECK_INT(st.alert, HR_UI_ALERT_NONE);
 }
 
 /* ------------------------------------------------------------------ */
@@ -731,6 +808,7 @@ int main(void)
     test_button_touches_only_ui_state();
     test_led_table();
     test_format_helpers();
+    test_pump_purge_screen();
     test_dim_defaults_and_timeouts();
     test_dim_telemetry_does_not_wake();
     test_dim_alert_floor();

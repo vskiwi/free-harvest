@@ -110,6 +110,8 @@ void hr_display_post_telemetry(const hr_telemetry_t *t, hr_phase_t phase,
     tel->phase_pct = (t->type == 4 || t->type == 5 || t->type == 6)
                          ? t->phase_pct : -1;
     tel->prep_remaining_s = t->prep_active ? t->prep_remaining_s : 0;
+    tel->purge_remaining_s = t->purge_active ? t->purge_remaining_s : 0;
+    tel->purge_pump_on = t->purge_active && t->purge_pump_on;
     tel->freeze_eta_s = freeze_eta_s;
     snprintf(tel->mode, sizeof(tel->mode), "%s", t->mode);
     if (last_stat) {

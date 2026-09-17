@@ -208,6 +208,8 @@ static void on_inbound(const hr_frame_t *f, void *user)
         t->phase_elapsed_s = tel.phase_elapsed_s;
         t->phase_pct = tel.phase_pct;
         t->prep_remaining_s = tel.prep_remaining_s;
+        t->purge_remaining_s = tel.purge_remaining_s;
+        t->purge_pump_on = tel.purge_pump_on;
         t->freeze_eta_s = hr_freeze_eta_s(&r->tracker, &tel);
         snprintf(t->mode, sizeof(t->mode), "%s", tel.mode);
         snprintf(t->last_stat, sizeof(t->last_stat), "%s",
