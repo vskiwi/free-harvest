@@ -196,6 +196,34 @@ config HR_WIFI_NOIP_RECONNECT_MAX_S
         many seconds, forever - the adapter is powered by the dryer and
         must find its way back on its own.
 
+config HR_WIFI_GW_PROBE_S
+    int "Link watchdog: probe the gateway every (seconds, 0 = off)"
+    range 0 600
+    default 20
+    help
+        On a weak signal a station can go on hearing the router's beacons
+        (sent slow and loud) after its own frames stop getting across. The
+        driver stays associated, the DHCP lease stays valid, the status
+        says "connected" with an address - and nothing is reachable, until
+        the router drops the station (minutes) or the lease runs out
+        (hours). While an address is held the adapter sends the gateway an
+        ARP request this often; a router that is there at all answers it.
+        0 turns the probe off.
+
+config HR_WIFI_GW_PROBE_MISSES
+    int "Link watchdog: unanswered probes in a row before rejoining"
+    range 1 20
+    default 3
+    help
+        This many probes without an answer in a row and the link is
+        reported as "unreachable" (not connected, like "no-ip") and the
+        network is left and rejoined so the router sees the station afresh.
+        With the 20 s default interval, 3 misses means a dead link is acted
+        on within about a minute. The misses required double on each rejoin
+        that still gets no answer (up to 16x), and reset at the first answer,
+        so a router that is really gone is not rejoined every minute for
+        hours. The setup AP is NOT re-opened by these rejoins.
+
 config HR_ACK_PAYLOAD
     string "GOTIT ack payload (UNVERIFIED)"
     default "ESP32ADAPTER"

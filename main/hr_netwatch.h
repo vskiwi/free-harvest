@@ -23,8 +23,23 @@
  *                                  repeated with doubling back-off while the
  *                                  address stays missing
  *
+ * The second thing it watches is the link BEHIND a valid address. On a weak
+ * signal the station can keep hearing the router's beacons (sent at the
+ * lowest rate, loudest) while its own frames no longer get across: the
+ * driver stays associated, lwIP keeps the lease, "connected" plus an
+ * address is shown, and nothing answers. That state ends only when the
+ * router gives up on the station (minutes) or the lease runs out (hours).
+ * So while an address is held the caller probes the gateway - an ARP
+ * request it must answer if it is there at all - and reports each result:
+ *
+ *   probe_miss_limit misses in a row -> the link counts as DEAD (status
+ *                                       flips) and the network is rejoined;
+ *                                       the misses needed double on each
+ *                                       rejoin that does not bring an
+ *                                       answer, reset by the first that does
+ *
  * Pure and host-testable: no ESP-IDF, no timers of its own. The caller feeds
- * it the clock and the two facts and performs the action it returns. Time is
+ * it the clock and the facts and performs the action it returns. Time is
  * a uint32_t millisecond counter; wrap-around is handled by subtraction.
  */
 #ifndef HR_NETWATCH_H
@@ -44,6 +59,8 @@ typedef struct {
     uint32_t dhcp_restart_ms; /* no IP for this long: restart the client */
     uint32_t reconnect_ms;    /* no IP for this long: rejoin the network */
     uint32_t reconnect_max_ms; /* cap for the doubling reconnect back-off */
+    uint32_t probe_miss_limit; /* unanswered gateway probes in a row before
+                                 the link counts as dead (0 = default 3) */
 } hr_netwatch_cfg_t;
 
 typedef struct {
@@ -60,6 +77,13 @@ typedef struct {
     uint32_t episodes;        /* no-IP episodes that outlived the grace */
     uint32_t dhcp_restarts;
     uint32_t reconnects;
+    /* Gateway reachability while an address is held. */
+    uint32_t probe_misses;    /* unanswered probes in a row */
+    bool dead;                /* misses reached the limit; link counts dead */
+    uint32_t dead_since_ms;
+    uint32_t dead_backoff_n;  /* dead-link rejoins since the last answer */
+    uint32_t dead_episodes;   /* since boot */
+    uint32_t dead_reconnects; /* since boot */
 } hr_netwatch_t;
 
 /* Sensible defaults: 5 s grace, restart DHCP at 15 s, rejoin at 45 s,
@@ -88,5 +112,24 @@ uint32_t hr_netwatch_noip_for_ms(const hr_netwatch_t *w, uint32_t now_ms);
 
 /* The reconnect delay in force for the current episode (back-off applied). */
 uint32_t hr_netwatch_reconnect_delay_ms(const hr_netwatch_t *w);
+
+/*
+ * Result of one gateway probe. Only counted while associated with an
+ * address - without one the no-IP path above is already at work. Returns
+ * HR_NETWATCH_RECONNECT when the misses in a row reach the limit in force
+ * (probe_miss_limit doubled per dead-link rejoin, capped at 16x); the
+ * caller rejoins the network. An answer clears everything.
+ */
+hr_netwatch_action_t hr_netwatch_on_probe(hr_netwatch_t *w, bool answered,
+                                          uint32_t now_ms);
+
+/* True while the link counts as dead: address held, gateway not answering. */
+bool hr_netwatch_dead(const hr_netwatch_t *w);
+
+/* Milliseconds the link has counted as dead, 0 when it does not. */
+uint32_t hr_netwatch_dead_for_ms(const hr_netwatch_t *w, uint32_t now_ms);
+
+/* The number of misses in a row that will count as dead right now. */
+uint32_t hr_netwatch_probe_miss_limit(const hr_netwatch_t *w);
 
 #endif /* HR_NETWATCH_H */

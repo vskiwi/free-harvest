@@ -2535,6 +2535,10 @@ async function refreshState(){
        token reads like a typo. */
     const wifiText = st.wifi==="no-ip"
       ? "Wi-Fi: no IP address (DHCP), reconnecting"+(st.noip_s? " · "+st.noip_s+"s" : "")
+      /* "unreachable": joined, address held, but the router stopped answering
+         the station (weak signal, or it forgot us); rejoining. */
+      : st.wifi==="unreachable"
+      ? "Wi-Fi: router not answering, rejoining"+(st.gw_dead_s? " · "+st.gw_dead_s+"s" : "")
       : st.wifi;
     $("#hdrsub").textContent = st.wifi==="connected"
       ? (linked? "dryer connected" : "waiting for dryer") : wifiText;

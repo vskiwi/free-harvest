@@ -195,6 +195,10 @@ static const char *wifi_status_str(void)
     /* Associated, no address: the lease was lost and DHCP is not answering.
      * Deliberately not "connected" - nothing is reachable in this state. */
     case HR_WIFI_NO_IP: return "no-ip";
+    /* Associated with an address, but the gateway does not answer ARP: the
+     * station hears the router, the router no longer hears the station.
+     * Not "connected" either - nothing is reachable. */
+    case HR_WIFI_UNREACHABLE: return "unreachable";
     default: return "booting";
     }
 }
@@ -337,6 +341,12 @@ static esp_err_t h_state(httpd_req_t *req)
                       * it now reads wifi:"no-ip" with noip_s counting. */
                      "\"sta_assoc\":%s,\"noip_s\":%lu,\"noip_episodes\":%u,"
                      "\"noip_dhcp_restarts\":%u,\"noip_reconnects\":%u,"
+                     /* The gateway probe: seconds the link has counted as
+                      * dead behind a valid address, probes unanswered in a
+                      * row right now, and since boot the dead-link episodes
+                      * and the rejoins they caused. */
+                     "\"gw_dead_s\":%lu,\"gw_probe_misses\":%u,"
+                     "\"gw_dead_episodes\":%u,\"gw_dead_reconnects\":%u,"
                      /* The driver's side of the link (hr_wifi_link_stats):
                       * signal, associations made and lost, joins that
                       * failed, beacon timeouts, the last reason code, and
@@ -377,6 +387,8 @@ static esp_err_t h_state(httpd_req_t *req)
                      wifi_status_str(), ip, ssid,
                      noip.associated ? "true" : "false", noip.noip_s,
                      noip.episodes, noip.dhcp_restarts, noip.reconnects,
+                     noip.dead_s, noip.probe_misses, noip.dead_episodes,
+                     noip.dead_reconnects,
                      lnk.rssi_dbm, lnk.joins, lnk.drops, lnk.join_fails,
                      lnk.bcn_timeouts, lnk.last_reason, lnk.assoc_s, lnk.up_s,
                      lnk.down_s,
