@@ -222,6 +222,8 @@ static esp_err_t h_state(httpd_req_t *req)
     hr_wifi_current_ssid(ssid, sizeof(ssid));
     hr_wifi_noip_stats_t noip;
     hr_wifi_noip_stats(&noip);
+    hr_wifi_link_stats_t lnk;
+    hr_wifi_link_stats(&lnk);
 
     char laststat[HR_MAX_FRAME * 2];
     LOCK();
@@ -325,6 +327,15 @@ static esp_err_t h_state(httpd_req_t *req)
                       * it now reads wifi:"no-ip" with noip_s counting. */
                      "\"sta_assoc\":%s,\"noip_s\":%lu,\"noip_episodes\":%u,"
                      "\"noip_dhcp_restarts\":%u,\"noip_reconnects\":%u,"
+                     /* The driver's side of the link (hr_wifi_link_stats):
+                      * signal, associations made and lost, joins that
+                      * failed, beacon timeouts, the last reason code, and
+                      * how long the current state has held. What is left
+                      * to read after the log ring has scrolled. */
+                     "\"rssi_dbm\":%d,\"wifi_joins\":%u,\"wifi_drops\":%u,"
+                     "\"wifi_join_fails\":%u,\"wifi_bcn_timeouts\":%u,"
+                     "\"wifi_last_reason\":%d,\"wifi_assoc_s\":%lu,"
+                     "\"wifi_up_s\":%lu,\"wifi_down_s\":%lu,"
                      "\"phase\":%d,\"phase_label\":\"%s\",\"have_tel\":%s,"
                      "\"temp_f\":%ld,\"pressure\":%ld,\"elapsed_s\":%ld,"
                      "\"prep_s\":%ld,\"mode\":\"%s\",\"stat_type\":%d,"
@@ -353,6 +364,9 @@ static esp_err_t h_state(httpd_req_t *req)
                      wifi_status_str(), ip, ssid,
                      noip.associated ? "true" : "false", noip.noip_s,
                      noip.episodes, noip.dhcp_restarts, noip.reconnects,
+                     lnk.rssi_dbm, lnk.joins, lnk.drops, lnk.join_fails,
+                     lnk.bcn_timeouts, lnk.last_reason, lnk.assoc_s, lnk.up_s,
+                     lnk.down_s,
                      (int)ph, hr_phase_label(ph), tel_valid ? "true" : "false",
                      tel_valid ? tel.temperature_f : 0,
                      tel_valid ? tel.pressure_raw : 0,

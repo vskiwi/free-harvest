@@ -62,6 +62,38 @@ typedef struct {
 
 void hr_wifi_noip_stats(hr_wifi_noip_stats_t *out);
 
+/*
+ * The driver's side of the link since boot, for /api/state. The log ring
+ * keeps minutes; an outage found hours later has to be read from these and
+ * from the "wifi ..." event records in the capture (hr_capture.h):
+ *
+ *   joins        associations completed (WIFI_EVENT_STA_CONNECTED)
+ *   drops        associations lost (STA_DISCONNECTED while associated)
+ *   join_fails   connect attempts that never associated (201 = network not
+ *                found, 2/15 = auth or handshake timed out, ...)
+ *   bcn_timeouts beacons missed for the driver's inactive time - what a weak
+ *                or interfered signal looks like from the chip
+ *   last_reason  wifi_err_reason_t of the most recent drop or failure
+ *   rssi_dbm     signal of the current association, 0 when none
+ *   assoc_s      seconds in the current association, 0 when none
+ *   up_s         seconds the status has been CONNECTED, 0 otherwise
+ *   down_s       seconds since CONNECTED was last lost, 0 while connected or
+ *                if it never was
+ */
+typedef struct {
+    unsigned joins;
+    unsigned drops;
+    unsigned join_fails;
+    unsigned bcn_timeouts;
+    int last_reason;
+    int rssi_dbm;
+    unsigned long assoc_s;
+    unsigned long up_s;
+    unsigned long down_s;
+} hr_wifi_link_stats_t;
+
+void hr_wifi_link_stats(hr_wifi_link_stats_t *out);
+
 /* The SSID we are connected to or configured for ("" if none). */
 void hr_wifi_current_ssid(char *out, size_t cap);
 

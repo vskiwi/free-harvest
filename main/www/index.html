@@ -2479,9 +2479,15 @@ async function refreshState(){
     }
     $("#set-wifi-sub").textContent = st.wifi==="connected"
       ? (st.ssid||"connected")+" · "+st.ip : wifiText;
+    /* Signal and link history: a dongle at -90 dBm under a steel chassis
+       works until it does not, and this is where that is visible first. */
+    const rssi = (st.wifi==="connected" && st.rssi_dbm) ? " · "+st.rssi_dbm+" dBm" : "";
+    const drops = (st.wifi_drops||st.wifi_join_fails)
+      ? " · link lost "+(st.wifi_drops||0)+"×, joins failed "+(st.wifi_join_fails||0)+"×"
+      : "";
     $("#wifiinfo").innerHTML = st.wifi==="connected"
-      ? "Connected to <b>"+esc(st.ssid||"")+"</b> at <b>"+esc(st.ip||"")+"</b>"
-      : "Status: "+esc(wifiText);
+      ? "Connected to <b>"+esc(st.ssid||"")+"</b> at <b>"+esc(st.ip||"")+"</b>"+rssi+drops
+      : "Status: "+esc(wifiText)+drops;
 
     /* onboarding gating */
     const wifiOK = st.wifi==="connected";
