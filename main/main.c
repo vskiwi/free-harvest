@@ -14,6 +14,9 @@
 #include "hr_capture.h"
 #include "hr_batchstore.h"
 #include "hr_compat.h"
+#if CONFIG_HR_BATCH_HISTORY
+#include "hr_dryerfiles.h"
+#endif
 #include "hr_units.h"
 #include "hr_encring.h"
 #include "hr_enc.h"
@@ -263,6 +266,11 @@ static void on_inbound(const hr_frame_t *f, void *user)
         hr_capture_append((uint32_t)now_ms(), line);
     }
 
+#if CONFIG_HR_BATCH_HISTORY
+    /* FDFILELIST answers to our FDFILES; copy-only on this task. */
+    hr_dryerfiles_on_frame(f);
+#endif
+
     /* Decode STAT frames once, then share with both the web UI and MQTT. */
     hr_telemetry_t tel;
     if (hr_telemetry_from_stat(f, &tel)) {
@@ -509,6 +517,11 @@ void app_main(void)
      * presentation only - the dryer keeps sending F and so do /api/state and
      * MQTT. Read in post_display_status() on boards with a screen. */
     hr_units_init();
+#if CONFIG_HR_BATCH_HISTORY
+    /* Before hr_usb_init(): lends the session its block side buffer, so the
+     * first byte from the dryer already meets the complete framer. */
+    hr_dryerfiles_init(&s_session);
+#endif
 
     hr_usb_init(&s_session);
 
@@ -881,6 +894,19 @@ void app_main(void)
             }
         }
         hr_http_set_tracker(&s_tracker);
+#if CONFIG_HR_BATCH_HISTORY
+        /*
+         * The dryer's file client: requests go out from here, blocks are
+         * written to flash from here. "Running" is the logbook's notion,
+         * so a fetch is refused for exactly the runs the logbook records.
+         */
+        {
+            xSemaphoreTake(s_hist_lock, portMAX_DELAY);
+            const bool running = s_last_running;
+            xSemaphoreGive(s_hist_lock);
+            hr_dryerfiles_tick(t, s_session.link == HR_LINK_UP, running);
+        }
+#endif
 #if HR_HAVE_UI
         post_display_status();
 #endif

@@ -169,6 +169,7 @@
   .sw-t{background:var(--accent)}
   .sw-r{background:var(--muted); opacity:.55}
   .sw-p{background:#c98bff}
+  .sw-room{background:#3fb950}
   .chiptog{margin-left:auto; padding:6px 12px; font-size:12.5px}
   .facts b{color:var(--accent); font-weight:650}
   @keyframes marq{from{transform:translateX(0)} to{transform:translateX(-50%)}}
@@ -587,6 +588,9 @@
         <div class="item" data-go="s-frames"><span>📡</span>
           <div class="t"><b>Live data feed</b><span>Frames &amp; verbs from the dryer</span></div>
           <span class="chev">›</span></div>
+        <div class="item" data-go="s-files" id="set-files-item"><span>🗂️</span>
+          <div class="t"><b>Batch history</b><span id="set-files-sub">The dryer's own batch logs</span></div>
+          <span class="chev">›</span></div>
         <div class="item" data-go="s-fw"><span>⬆️</span>
           <div class="t"><b>Firmware update</b><span>Install a new .bin over Wi-Fi</span></div>
           <span class="chev">›</span></div>
@@ -758,6 +762,54 @@
       <div id="otastatus" class="notice"></div>
       <div class="hint">Writes to the spare slot and verifies before switching.
         A bad file is rejected and the current firmware keeps running.</div>
+    </div>
+  </section>
+
+  <!-- ---------- settings: batch history (the dryer's own files) ---------- -->
+  <section id="v-s-files" class="view">
+    <button class="back" data-back>‹ Settings</button>
+
+    <div class="card">
+      <h2>Batch history</h2>
+      <div class="hint">The dryer keeps a CSV log of every batch — shelf, top
+        and bottom thermocouples, the <b>room</b> thermocouple no live frame
+        carries, vacuum and heater state, minute by minute. This page reads
+        those files over the same USB link (<span class="mono">FDFILES</span> /
+        <span class="mono">FILEREAD</span>, both read-only) and keeps copies on
+        the adapter.</div>
+      <div id="df-status" class="notice" style="margin-top:10px"></div>
+      <div class="rcprow" style="margin-top:10px">
+        <button type="button" id="df-refresh" class="primary">Refresh list from dryer</button>
+        <button type="button" id="df-cancel" class="ghost">Cancel</button>
+        <button type="button" id="df-enable" class="ghost">Enabled: —</button>
+      </div>
+      <label class="hint" style="display:flex;gap:8px;align-items:center;margin-top:10px">
+        <input type="checkbox" id="df-force"> Allow while a batch is running
+        (a request every quarter second on the dryer's USB link — off unless
+        you are watching)</label>
+    </div>
+
+    <div class="card">
+      <h2>Files on the dryer</h2>
+      <div id="df-list"><div class="hint">Tap “Refresh list from dryer”.</div></div>
+      <div class="hint" id="df-listnote"></div>
+    </div>
+
+    <div class="card" id="df-chartcard" style="display:none">
+      <h2 id="df-title">Batch</h2>
+      <div class="chartwrap"><svg id="df-chart" viewBox="0 0 600 240"
+           preserveAspectRatio="none" role="img"
+           aria-label="Shelf, room temperature and vacuum over the batch"></svg></div>
+      <div class="chartlegend">
+        <span><i class="sw sw-t"></i>Shelf</span>
+        <span><i class="sw sw-room"></i>Room</span>
+        <span id="df-lg-p"><i class="sw sw-p"></i>Vacuum</span>
+        <button id="df-press" class="ghost chiptog">Hide vacuum</button>
+      </div>
+      <div class="hint" id="df-note"></div>
+      <div class="rcprow" style="margin-top:12px">
+        <a id="df-download" class="ghost" style="text-align:center;text-decoration:none;padding:10px" download>Download CSV</a>
+      </div>
     </div>
   </section>
 
@@ -1029,6 +1081,8 @@ function show(id){
       refreshLogbook();
       refreshPin();
     }
+    /* The dryer-files page polls only while it is showing (dfPoll checks). */
+    if(el.id === "v-s-files" && typeof dfRefresh === "function") dfRefresh();
   }
   /* Keep the tab highlight in step however the view changed - X, backdrop,
      Escape and back-buttons all route through here, not just tab taps. */
@@ -2828,6 +2882,7 @@ function repaintUnit(){
   if(lastState) paintDash(lastState);
   refreshTrend();
   refreshLogbook();
+  if(typeof dfData!=="undefined" && dfData) dfDraw(dfData);
 }
 /* The adapter's own screen (T-Dongle-S3) cannot read this browser's choice,
    so it keeps a unit of its own in NVS (/api/units, PIN-gated like the other
@@ -3083,6 +3138,246 @@ $("#trendpress").addEventListener("click",()=>{
   trendShowPress=!trendShowPress;
   $("#trendpress").textContent=trendShowPress?"Hide vacuum":"Show vacuum";
   refreshTrend();
+});
+
+/* ---------- Batch history: the dryer's own CSV files ----------
+   GET /api/dryer/files is what the adapter already knows (list, cache,
+   progress) and is polled while a transfer runs. The POSTs make the adapter
+   ask the dryer and go through ctrlPost for the PIN. The chart is the run
+   chart's twin: same helpers, same look, three series - shelf and room on
+   the degree axis, vacuum on its own axis at the right. */
+let dfLast=null, dfShowPress=true, dfOpen=null, dfTimer=null, dfLastBusy=false, dfData=null;
+
+function dfFmtSize(n){ return n>=10240 ? Math.round(n/1024)+" KB" : n+" B"; }
+/* "00042.26-09-15_10.30.csv" -> "#42 · 2026-09-15 10:30", else the name */
+function dfNameInfo(name){
+  const m=/^(\d{5})\.(\d{2,4})-(\d{2})-(\d{2})_(\d{2})\.(\d{2})\.csv$/i.exec(name);
+  if(!m) return {title:name, sub:""};
+  const y=m[2].length===2?"20"+m[2]:m[2];
+  return {title:"Batch #"+parseInt(m[1],10), sub:y+"-"+m[3]+"-"+m[4]+" "+m[5]+":"+m[6]};
+}
+
+function dfRenderStatus(d){
+  const st=$("#df-status");
+  $("#df-enable").textContent="Enabled: "+(d.enabled?"yes":"no");
+  $("#set-files-sub").textContent = d.enabled
+    ? (d.list_valid ? d.files.length+" files on the dryer" : "The dryer's own batch logs")
+    : "Switched off";
+  let msg, kind="info";
+  if(!d.enabled){
+    msg="Switched off. Nothing is sent to the dryer until it is enabled here.";
+  }else if(d.busy){
+    msg=(d.state==="listing" ? "Listing files… "+(d.requests||0)+" asked"
+        : "Reading "+esc(d.file)+" — block "+d.block+
+          (d.size>0 ? ", "+dfFmtSize(d.received)+" of "+dfFmtSize(d.size)+" ("+d.pct+"%)" : ""));
+  }else if(d.error){
+    msg="Last transfer failed: "+esc(d.error)+(d.file?" ("+esc(d.file)+")":"")+".";
+    kind="bad";
+  }else if(d.state==="done"){
+    msg="Last transfer complete"+(d.file?": "+esc(d.file):"")+".";
+    kind="ok";
+  }else{
+    msg=d.link ? "Idle. Link to the dryer is up." : "Idle. No link to the dryer.";
+  }
+  if(d.dryer_running && d.enabled) msg+=" The dryer is running a batch — fetching is off unless allowed below.";
+  note(st,msg,kind);
+  $("#df-cancel").style.display=d.busy?"":"none";
+  $("#df-refresh").disabled=d.busy||!d.enabled;
+}
+
+function dfRenderList(d){
+  const box=$("#df-list");
+  if(!d.list_valid && !d.files.length){
+    box.innerHTML='<div class="hint">'+(d.busy&&d.state==="listing"
+      ? "Asking the dryer…" : "No list yet. Tap “Refresh list from dryer”.")+'</div>';
+    $("#df-listnote").textContent="";
+    return;
+  }
+  box.innerHTML="";
+  const cached=new Set(d.cached||[]);
+  const files=(d.files||[]).slice().sort((a,b)=>b.name.localeCompare(a.name));
+  files.forEach(f=>{
+    const el=document.createElement("div");
+    el.className="rcp";
+    const info=dfNameInfo(f.name);
+    const isCached=cached.has(f.name)||f.cached;
+    el.innerHTML="<h3></h3><div class='meta'></div><div class='rcprow'>"+
+      "<button type='button' class='df-open' "+(isCached?"":"disabled")+">Open</button>"+
+      "<button type='button' class='df-fetch ghost'></button></div>";
+    el.querySelector("h3").textContent=info.title;
+    el.querySelector(".meta").textContent=
+      [info.sub, f.name, dfFmtSize(f.size), isCached?"on adapter":"on dryer only"]
+        .filter(Boolean).join("  \u00b7  ");
+    const fb=el.querySelector(".df-fetch");
+    fb.textContent=isCached?"Fetch again":"Fetch";
+    fb.disabled=d.busy||!d.enabled||f.size>d.max_size;
+    fb.addEventListener("click",()=>dfFetch(f.name));
+    el.querySelector(".df-open").addEventListener("click",()=>dfOpenFile(f.name));
+    box.appendChild(el);
+  });
+  /* cached copies of files the dryer no longer lists (or before any list) */
+  (d.cached||[]).filter(n=>!files.some(f=>f.name===n)).forEach(n=>{
+    const el=document.createElement("div");
+    el.className="rcp";
+    const info=dfNameInfo(n);
+    el.innerHTML="<h3></h3><div class='meta'></div><div class='rcprow'>"+
+      "<button type='button' class='df-open'>Open</button></div>";
+    el.querySelector("h3").textContent=info.title;
+    el.querySelector(".meta").textContent=[info.sub,n,"copy on adapter"].filter(Boolean).join("  \u00b7  ");
+    el.querySelector(".df-open").addEventListener("click",()=>dfOpenFile(n));
+    box.appendChild(el);
+  });
+  $("#df-listnote").textContent = d.list_valid
+    ? files.length+" file"+(files.length===1?"":"s")+" matching .csv"+
+      (d.list_age_ms>=0 ? ", listed "+fmtDur(Math.round(d.list_age_ms/1000))+" ago" : "")+
+      ". Files over "+dfFmtSize(d.max_size)+" are not fetched."
+    : "";
+}
+
+async function dfRefresh(){
+  try{
+    const d=await (await fetch("/api/dryer/files")).json();
+    dfLast=d;
+    dfRenderStatus(d);
+    dfRenderList(d);
+    /* poll while a transfer runs, only while the page is showing */
+    clearTimeout(dfTimer);
+    if(d.busy && $("#v-s-files").classList.contains("active")){
+      dfTimer=setTimeout(dfRefresh, 1000);
+    }else if(!d.busy && dfLastBusy && d.state==="done" && d.file){
+      /* a fetch we watched just finished: open it */
+      dfOpenFile(d.file);
+    }
+    dfLastBusy=!!d.busy;
+  }catch(e){ note($("#df-status"),"Could not reach the adapter.","bad"); }
+}
+
+async function dfPost(url, body){
+  const j=await ctrlPost(url, body);
+  if(!j.ok) note($("#df-status"), j.pin ? "PIN required." : ("Refused: "+esc(j.reason||"unknown")), "bad");
+  setTimeout(dfRefresh, 300);
+  return j;
+}
+$("#df-refresh").addEventListener("click",()=>{
+  dfPost("/api/dryer/files/refresh","pattern=.csv"+($("#df-force").checked?"&force=1":""));
+});
+$("#df-cancel").addEventListener("click",()=>dfPost("/api/dryer/files/cancel",""));
+$("#df-enable").addEventListener("click",()=>{
+  const cur=dfLast?!!dfLast.enabled:false;
+  if(!cur && !confirm("Enable reading the dryer's files?\n\nThe adapter will send FDFILES / FILEREAD "+
+     "(read-only requests) when you ask it to. Do this first with the dryer idle."))
+    return;
+  dfPost("/api/dryer/files/enable","on="+(cur?"0":"1"));
+});
+function dfFetch(name){
+  dfOpen=null;
+  dfPost("/api/dryer/files/fetch","name="+encodeURIComponent(name)+
+         ($("#df-force").checked?"&force=1":""));
+}
+
+async function dfOpenFile(name){
+  dfOpen=name;
+  const card=$("#df-chartcard");
+  card.style.display="";
+  const info=dfNameInfo(name);
+  $("#df-title").textContent=info.title+(info.sub?" \u00b7 "+info.sub:"");
+  $("#df-download").href="/api/dryer/files/get?name="+encodeURIComponent(name);
+  $("#df-download").setAttribute("download", name);
+  $("#df-note").textContent="Loading…";
+  try{
+    const d=await (await fetch("/api/dryer/files/get?name="+encodeURIComponent(name)+"&format=json")).json();
+    dfDraw(d);
+    card.scrollIntoView({behavior:"smooth",block:"start"});
+  }catch(e){ $("#df-note").textContent="Could not load the file."; }
+}
+function dfDraw(d){
+  dfData=d;
+  const svg=$("#df-chart"), W=600, H=240;
+  while(svg.firstChild) svg.removeChild(svg.firstChild);
+  const rows=d.rows||[], n=rows.length;
+  if(!d.header){ $("#df-note").textContent="The file has no recognisable header — see the CSV."; return; }
+  if(n<2){ $("#df-note").textContent="Fewer than two rows in this file."; return; }
+  /* columns: t_min, shelf_f, room_f, top_f, bot_f, mtorr, htr_on, process */
+  const T=rows.map(r=>r[0]), shelf=rows.map(r=>r[1]), room=rows.map(r=>r[2]),
+        mt=rows.map(r=>r[5]);
+  const totalMin=T[n-1]-T[0];
+  const L=44, R=dfShowPress?56:12, Tp=12, B=26, pw=W-L-R, ph=H-Tp-B;
+
+  let lo=Infinity, hi=-Infinity;
+  const seen=v=>{ if(v!==null&&isFinite(v)){ const u=toUnit(v); if(u<lo)lo=u; if(u>hi)hi=u; } };
+  shelf.forEach(seen); room.forEach(seen);
+  if(!isFinite(lo)){ $("#df-note").textContent="No temperatures in this file."; return; }
+  const flat=tempC?2:4;
+  if(hi-lo<flat){ const mid=(hi+lo)/2; lo=mid-flat/2; hi=mid+flat/2; }
+  const pad=(hi-lo)*0.12; lo-=pad; hi+=pad;
+  const x=i=>L+pw*((T[i]-T[0])/(totalMin||1));
+  const y=v=>Tp+ph-((v-lo)/(hi-lo))*ph;
+
+  const stepY=niceStep(hi-lo,4);
+  for(let g=Math.ceil(lo/stepY)*stepY; g<=hi; g+=stepY){
+    svg.appendChild(el("line",{x1:L,y1:y(g),x2:W-R,y2:y(g),stroke:"var(--line)","stroke-width":1}));
+    const t=el("text",{x:L-6,y:y(g)+4,"text-anchor":"end",fill:"var(--muted)","font-size":11});
+    t.textContent=Math.round(g)+"\u00b0"; svg.appendChild(t);
+  }
+  const fz=toUnit(32);
+  if(lo<fz&&hi>fz) svg.appendChild(el("line",{x1:L,y1:y(fz),x2:W-R,y2:y(fz),
+    stroke:"var(--muted)","stroke-width":1,"stroke-dasharray":"2 4",opacity:.5}));
+  const totalS=totalMin*60, stepX=niceStep(totalS||60,4);
+  for(let g=0; g<=totalS+1; g+=stepX){
+    const xi=L+pw*(g/(totalS||1));
+    const t=el("text",{x:xi,y:H-8,"text-anchor":"middle",fill:"var(--muted)","font-size":11});
+    t.textContent=g?fmtDur(g):"0"; svg.appendChild(t);
+  }
+  const path=(vals,scale)=>{
+    let out="", pen=false;
+    for(let i=0;i<n;i++){ const v=vals[i];
+      if(v===null||!isFinite(v)){ pen=false; continue; }
+      out+=(pen?"L":"M")+x(i).toFixed(1)+" "+y(scale(v)).toFixed(1)+" "; pen=true; }
+    return out.trim();
+  };
+  const pr=path(room,toUnit);
+  if(pr) svg.appendChild(el("path",{d:pr,fill:"none",stroke:"#3fb950","stroke-width":2,
+    "stroke-linejoin":"round"}));
+  const ps=path(shelf,toUnit);
+  if(ps) svg.appendChild(el("path",{d:ps,fill:"none",stroke:"var(--accent)","stroke-width":2.5,
+    "stroke-linejoin":"round","stroke-linecap":"round"}));
+
+  /* vacuum: only real readings (< 10000 mTorr, the dryer's "pump off" cap
+     and above is atmosphere), log-ish feel avoided - a plain scale reads
+     fine once the atmosphere rows are excluded */
+  const vac=mt.map(v=>(v!==null&&v<10000)?v:null);
+  const anyP=vac.some(v=>v!==null);
+  $("#df-lg-p").style.display=(dfShowPress&&anyP)?"":"none";
+  $("#df-press").style.display=anyP?"":"none";
+  if(dfShowPress&&anyP){
+    let plo=Infinity, phi=-Infinity;
+    vac.forEach(v=>{ if(v!==null){ if(v<plo)plo=v; if(v>phi)phi=v; } });
+    if(phi-plo<10) phi=plo+10;
+    const py=v=>Tp+ph-((v-plo)/(phi-plo))*ph;
+    let out="",pen=false;
+    for(let i=0;i<n;i++){ const v=vac[i];
+      if(v===null){ pen=false; continue; }
+      out+=(pen?"L":"M")+x(i).toFixed(1)+" "+py(v).toFixed(1)+" "; pen=true; }
+    if(out) svg.appendChild(el("path",{d:out.trim(),fill:"none",stroke:"#c98bff",
+      "stroke-width":2,"stroke-dasharray":"4 3"}));
+    for(const g of [plo,phi]){
+      const t=el("text",{x:W-R+6,y:py(g)+4,fill:"#c98bff","font-size":11});
+      t.textContent=Math.round(g); svg.appendChild(t);
+    }
+  }
+  const lastRoom=[...room].reverse().find(v=>v!==null);
+  const roomVals=room.filter(v=>v!==null);
+  const roomTxt=roomVals.length
+    ? " \u00b7 room "+fmtTU(Math.min(...roomVals))+"–"+fmtTU(Math.max(...roomVals))+
+      (lastRoom!==undefined?" (last "+fmtTU(lastRoom)+")":"")
+    : " \u00b7 no room column";
+  $("#df-note").textContent=fmtDur(totalS)+" of data, "+n+" rows"+roomTxt+
+    ". Temperatures as the dryer logged them (whole \u00b0F), shown in "+tempSym()+".";
+}
+$("#df-press").addEventListener("click",()=>{
+  dfShowPress=!dfShowPress;
+  $("#df-press").textContent=dfShowPress?"Hide vacuum":"Show vacuum";
+  if(dfData) dfDraw(dfData);
 });
 
 /* ---------- 6.0.644170 handshake switch ----------

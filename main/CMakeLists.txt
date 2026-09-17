@@ -20,6 +20,10 @@ endif()
 if(CONFIG_HR_BUTTON)
     list(APPEND srcs "hr_button.c")
 endif()
+# The dryer's own batch files (FDFILES / FILEREAD client), any board.
+if(CONFIG_HR_BATCH_HISTORY)
+    list(APPEND srcs "hr_dryerfiles.c")
+endif()
 
 idf_component_register(
     SRCS ${srcs}
