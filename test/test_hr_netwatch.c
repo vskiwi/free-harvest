@@ -11,10 +11,12 @@
 #include "hr_netwatch.h"
 #include "test_util.h"
 
-/* Short timings so the tests read in seconds: 2 s grace, DHCP restart at
- * 5 s, rejoin at 10 s, rejoin back-off capped at 40 s. */
+/* Short timings so the tests read in seconds: 2 s grace (4 s for the first
+ * address after a join), DHCP restart at 5 s, rejoin at 10 s, rejoin
+ * back-off capped at 40 s. */
 static const hr_netwatch_cfg_t CFG = {
     .grace_ms = 2000,
+    .first_grace_ms = 4000,
     .dhcp_restart_ms = 5000,
     .reconnect_ms = 10000,
     .reconnect_max_ms = 40000,
@@ -43,13 +45,71 @@ static void test_defaults(void)
     hr_netwatch_t w;
     hr_netwatch_init(&w, NULL);
     CHECK_INT(w.cfg.grace_ms, 5000);
+    CHECK_INT(w.cfg.first_grace_ms, 12000);
     CHECK_INT(w.cfg.dhcp_restart_ms, 15000);
     CHECK_INT(w.cfg.reconnect_ms, 45000);
     CHECK_INT(w.cfg.reconnect_max_ms, 360000);
+    CHECK_INT(w.cfg.probe_miss_limit, 3);
 
     hr_netwatch_cfg_t big = {.reconnect_ms = 900000, .reconnect_max_ms = 1000};
     hr_netwatch_init(&w, &big);
     CHECK_INT(w.cfg.reconnect_max_ms, 900000);
+
+    /* The first grace stays between the ordinary grace and the DHCP
+     * restart, whatever it is set to. */
+    hr_netwatch_cfg_t late = {.grace_ms = 5000, .first_grace_ms = 20000,
+                              .dhcp_restart_ms = 15000};
+    hr_netwatch_init(&w, &late);
+    CHECK_INT(w.cfg.first_grace_ms, 15000);
+    hr_netwatch_cfg_t early = {.grace_ms = 5000, .first_grace_ms = 1000,
+                               .dhcp_restart_ms = 15000};
+    hr_netwatch_init(&w, &early);
+    CHECK_INT(w.cfg.first_grace_ms, 5000);
+}
+
+static void test_slow_first_dhcp_is_not_an_episode(void)
+{
+    TEST_CASE("a first address that takes longer than the grace, but not the first grace, is quiet");
+    hr_netwatch_t w;
+    hr_netwatch_init(&w, &CFG);
+    uint32_t t = S(1);
+    hr_netwatch_on_assoc(&w, t);
+    CHECK_INT(hr_netwatch_grace_ms(&w), S(4));
+    /* On a weak link DHCP from scratch takes 3 s: past the 2 s grace, not
+     * past the 4 s first grace. */
+    t += S(3);
+    CHECK_INT(hr_netwatch_tick(&w, false, t), HR_NETWATCH_NONE);
+    CHECK(!hr_netwatch_no_ip(&w, t));
+    CHECK_INT(w.episodes, 0);
+    t += 500;
+    CHECK_INT(hr_netwatch_tick(&w, true, t), HR_NETWATCH_NONE);
+    CHECK_INT(w.episodes, 0);
+    CHECK(!w.first_ip_pending);
+    /* From here the ordinary grace applies: a lost lease shows at 2 s. */
+    CHECK_INT(hr_netwatch_grace_ms(&w), S(2));
+    uint32_t lost = t + S(600);
+    t = lost;
+    hr_netwatch_tick(&w, false, t); /* the poll that sees 0.0.0.0 */
+    t = lost + S(2);
+    hr_netwatch_tick(&w, false, t);
+    CHECK(hr_netwatch_no_ip(&w, t));
+    CHECK_INT(w.episodes, 1);
+    /* A rejoin starts a fresh first-address wait. */
+    hr_netwatch_on_disassoc(&w, t);
+    t += S(1);
+    hr_netwatch_on_assoc(&w, t);
+    CHECK_INT(hr_netwatch_grace_ms(&w), S(4));
+    t += S(3);
+    hr_netwatch_tick(&w, false, t);
+    CHECK(!hr_netwatch_no_ip(&w, t));
+    CHECK_INT(w.episodes, 1);
+    /* But a join that never gets one is still reported, before the DHCP
+     * restart at 5 s. */
+    t += S(1);
+    hr_netwatch_tick(&w, false, t);
+    CHECK(hr_netwatch_no_ip(&w, t));
+    CHECK_INT(w.episodes, 2);
+    CHECK_INT(w.dhcp_restarts, 0);
 }
 
 static void test_normal_join_is_quiet(void)
@@ -402,6 +462,7 @@ static void test_probe_without_address_is_ignored(void)
 int main(void)
 {
     test_defaults();
+    test_slow_first_dhcp_is_not_an_episode();
     test_normal_join_is_quiet();
     test_lost_lease_is_reported_then_repaired();
     test_persistent_no_dhcp_backs_off();

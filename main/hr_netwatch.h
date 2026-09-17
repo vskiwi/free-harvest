@@ -56,6 +56,11 @@ typedef enum {
 
 typedef struct {
     uint32_t grace_ms;        /* no IP tolerated before it counts as NO_IP */
+    uint32_t first_grace_ms;  /* the same, for the first address after an
+                                 association: DHCP from scratch on a weak
+                                 link takes longer than a renewal
+                                 (0 = default 12 s; never past
+                                 dhcp_restart_ms) */
     uint32_t dhcp_restart_ms; /* no IP for this long: restart the client */
     uint32_t reconnect_ms;    /* no IP for this long: rejoin the network */
     uint32_t reconnect_max_ms; /* cap for the doubling reconnect back-off */
@@ -68,6 +73,7 @@ typedef struct {
     bool associated;
     bool have_ip;
     bool in_episode;          /* associated with no address right now */
+    bool first_ip_pending;    /* no address yet since this association */
     bool reported;            /* this episode has outlived the grace */
     uint32_t noip_since_ms;   /* when the current no-IP episode began */
     uint32_t last_action_ms;  /* when the last remedy was issued */
@@ -86,8 +92,8 @@ typedef struct {
     uint32_t dead_reconnects; /* since boot */
 } hr_netwatch_t;
 
-/* Sensible defaults: 5 s grace, restart DHCP at 15 s, rejoin at 45 s,
- * back-off capped at 6 minutes. */
+/* Sensible defaults: 5 s grace (12 s for the first address after a join),
+ * restart DHCP at 15 s, rejoin at 45 s, back-off capped at 6 minutes. */
 void hr_netwatch_init(hr_netwatch_t *w, const hr_netwatch_cfg_t *cfg);
 
 /* Station associated / left the access point. */
@@ -106,6 +112,10 @@ hr_netwatch_action_t hr_netwatch_tick(hr_netwatch_t *w, bool have_ip,
 
 /* True while associated with no address for longer than the grace. */
 bool hr_netwatch_no_ip(const hr_netwatch_t *w, uint32_t now_ms);
+
+/* The grace in force: first_grace_ms until the association's first
+ * address, grace_ms after it. */
+uint32_t hr_netwatch_grace_ms(const hr_netwatch_t *w);
 
 /* Milliseconds of the current no-IP episode, 0 when there is none. */
 uint32_t hr_netwatch_noip_for_ms(const hr_netwatch_t *w, uint32_t now_ms);

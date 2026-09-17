@@ -172,7 +172,9 @@ config HR_WIFI_NOIP_DHCP_RESTART_S
         client is stopped and started so it begins from a clean state.
         Must be shorter than HR_WIFI_NOIP_RECONNECT_S to matter. The status
         (web UI, /api/state, the dryer's WIFIINFO) reports "no-ip" instead
-        of "connected" after 5 s regardless.
+        of "connected" after 5 s regardless (12 s for the first address
+        after a join, where DHCP starts from scratch and a weak link has
+        been seen to need 8 s).
 
 config HR_WIFI_NOIP_RECONNECT_S
     int "No-IP watchdog: leave and rejoin the network after (seconds)"
