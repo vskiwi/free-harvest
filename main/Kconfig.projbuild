@@ -283,6 +283,47 @@ config HR_BATCH_HISTORY_DEFAULT_ON
         wire by itself. Either way a read is refused while a batch runs
         unless the request says force=1.
 
+config HR_FILES_PIPELINE_DEPTH
+    int "Batch history: FILEREAD requests in flight (1-4)"
+    depends on HR_BATCH_HISTORY
+    range 1 4
+    default 1
+    help
+        How many FILEREAD requests the file client keeps unanswered at once
+        while reading a file. 1 is strict request-reply. 2 puts the request
+        for block n+1 on the wire while the dryer is still sending block n;
+        measured on 6.0.644170 the dryer itself needs ~170 ms per 1 KB block
+        either way, so this hides only the adapter's turnaround. Replies are
+        accepted in order only; a lost or duplicated block rewinds the
+        window. Overridable at runtime (POST /api/dryer/files/tune, NVS
+        hrfiles/depth).
+
+config HR_FILES_REQ_GAP_MS
+    int "Batch history: minimum spacing between FILEREAD requests, ms"
+    depends on HR_BATCH_HISTORY
+    range 0 5000
+    default 0
+    help
+        0 asks for the next block as soon as the previous reply is in (the
+        dryer's own pace, ~6 blocks a second). A positive value holds each
+        request back at least this long after the previous one, for a dryer
+        whose USB link should be spared; requests held back go out from the
+        main loop's 250 ms tick, so the effective floor is that tick.
+        Overridable at runtime (POST /api/dryer/files/tune, NVS hrfiles/gap).
+
+config HR_FILES_UNIT_SYNC
+    bool "Batch history: read the dryer's panel unit (HRTempFC.txt) after link-up"
+    depends on HR_BATCH_HISTORY
+    default y
+    help
+        A few seconds after every link-up (once the hello has been answered)
+        the file client reads the dryer's 11-byte HRTempFC.txt with one
+        FILEREAD, stores the panel's unit (Fahrenheit/Celsius) in NVS and
+        RAM, and the display preference AUTO follows it. Also re-read when a
+        new batch starts and on POST /api/units/sync. A read is cheap enough
+        to do mid-batch (one request, ~200 ms). Requires the batch history
+        switch to be on.
+
 config HR_HTTP_LOG_TO_UART
     bool "Also echo received frames to the UART console"
     default y

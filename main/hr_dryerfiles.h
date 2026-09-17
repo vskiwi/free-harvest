@@ -42,8 +42,18 @@
 
 /* List entries remembered from the last FDFILES sweep. */
 #define HR_DF_LIST_MAX  40
-/* Blocks per chunk handed to the HTTP handler (8 KB of heap, per transfer). */
+/*
+ * The chunk buffer between the USB RX task and the HTTP handler: 8 KB of
+ * heap for the transfer. It is a RING in effect - the handler takes what
+ * has arrived (from HR_DF_CHUNK_MIN_BLOCKS up) while the dryer keeps
+ * filling the rest, and the dryer is only asked to wait when fewer than
+ * `depth` blocks of room are left. The first version handed the buffer
+ * out only when FULL and asked for nothing while the browser took it: on
+ * the 276 KB file that idled the dryer for every 8 KB sent over a -95 dBm
+ * Wi-Fi link, ~17 % of the 55 s.
+ */
 #define HR_DF_CHUNK_BLOCKS 8
+#define HR_DF_CHUNK_MIN_BLOCKS 2
 
 typedef enum {
     HR_DF_OK = 0,
@@ -82,6 +92,14 @@ typedef struct {
     /* lifetime counters, for the log and the live probe */
     unsigned long requests, timeouts, blocks_ok, blocks_bad, transfers,
                   blocks_in, big_dropped;
+    /* pacing in force */
+    int depth;
+    unsigned long gap_ms;
+    /* the last/current transfer's timing (hr_files_t) */
+    unsigned long t_first_ms, t_dryer_ms, t_paused_ms;
+    /* panel-unit sync */
+    unsigned long unit_syncs, unit_sync_fails;
+    const char *unit_state;           /* "idle" / "due" / "reading" / "applying" */
 } hr_df_snapshot_t;
 
 void hr_dryerfiles_init(hr_session_t *s);
@@ -126,5 +144,30 @@ void hr_dryerfiles_snapshot(hr_df_snapshot_t *out);
 int hr_dryerfiles_state_json(char *out, size_t cap);
 
 const char *hr_df_result_str(hr_df_result_t r);
+
+/*
+ * Pacing: FILEREADs in flight (1..HR_FILES_DEPTH_MAX) and the minimum gap
+ * between requests. Kconfig gives the defaults, NVS (hrfiles/depth, /gap)
+ * overrides them; set() persists and applies at the next request.
+ */
+void hr_dryerfiles_pacing(int *depth, unsigned long *gap_ms);
+bool hr_dryerfiles_set_pacing(int depth, unsigned long gap_ms);
+
+/*
+ * The dryer's panel unit, from HRTempFC.txt (docs/30 §5), into hr_units.
+ *
+ * schedule(): read it `delay_ms` from now (main.c: a few seconds after the
+ * hello on every link-up; when a batch starts). The read waits for the
+ * link and for any transfer in progress, bypasses the running-batch rule
+ * (one 11-byte block), and retries once after 30 s on failure. sync_now():
+ * start it immediately if the machine is idle (POST /api/units/sync).
+ * poll(): apply a finished read to hr_units (NVS) - called from the main
+ * loop tick and by the HTTP handler waiting for a manual sync; never from
+ * the USB task. busy(): a sync is scheduled, reading or unapplied.
+ */
+void hr_dryerfiles_unit_sync_schedule(unsigned long delay_ms, const char *why);
+hr_df_result_t hr_dryerfiles_unit_sync_now(void);
+void hr_dryerfiles_unit_sync_poll(void);
+bool hr_dryerfiles_unit_sync_busy(void);
 
 #endif /* HR_DRYERFILES_H */

@@ -2,6 +2,7 @@
  * hr_files - see hr_files.h. Reads only; nothing here can change the dryer.
  */
 #include "hr_files.h"
+#include "hr_temp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -216,12 +217,34 @@ static void finish(hr_files_t *fs, hr_files_state_t st, hr_files_err_t err,
     fs->state = st;
     fs->err = err;
     fs->awaiting = false;
+    fs->inflight = 0;
     fs->pending = false;
+    if (fs->paused) {
+        fs->t_paused_ms += now - fs->paused_ms;
+    }
     fs->paused = false;
     fs->finished_ms = now;
     if (fs->done != NULL) {
         fs->done(st, err, fs->done_user);
     }
+}
+
+/* Forget the requests in flight and ask again from the expected block. */
+static void rewind_window(hr_files_t *fs)
+{
+    fs->inflight = 0;
+    fs->awaiting = false;
+    fs->next_req = fs->block;
+    fs->pending = true;
+}
+
+/* Blocks the file has, once the size is known; LONG_MAX-ish otherwise. */
+static long block_limit(const hr_files_t *fs)
+{
+    if (fs->size < 0) {
+        return -1;
+    }
+    return (fs->size + HR_FDBLOCK_SIZE - 1) / HR_FDBLOCK_SIZE;
 }
 
 void hr_files_init(hr_files_t *fs, hr_files_send_fn send, void *user)
@@ -235,7 +258,24 @@ void hr_files_init(hr_files_t *fs, hr_files_send_fn send, void *user)
     fs->timeout_ms = HR_FILES_TIMEOUT_MS;
     fs->max_retries = HR_FILES_RETRIES;
     fs->max_size = HR_FILES_MAX_SIZE;
+    fs->depth = 1;
+    fs->gap_ms = 0;
     fs->state = HR_FILES_IDLE;
+}
+
+void hr_files_set_pacing(hr_files_t *fs, int depth, unsigned long gap_ms)
+{
+    if (fs == NULL) {
+        return;
+    }
+    if (depth < 1) {
+        depth = 1;
+    }
+    if (depth > HR_FILES_DEPTH_MAX) {
+        depth = HR_FILES_DEPTH_MAX;
+    }
+    fs->depth = depth;
+    fs->gap_ms = gap_ms;
 }
 
 void hr_files_set_sink(hr_files_t *fs, hr_files_sink_fn fn, void *user)
@@ -291,9 +331,13 @@ bool hr_files_start_list(hr_files_t *fs, const char *pattern,
     fs->entries = 0;
     fs->retries = 0;
     fs->awaiting = false;
+    fs->inflight = 0;
+    fs->eof = false;
+    fs->first_sent = false;
     fs->paused = false;
     fs->pending = true;
     fs->started_ms = now_ms;
+    fs->t_first_ms = fs->t_dryer_ms = fs->t_paused_ms = 0;
     fs->state = HR_FILES_LISTING;
     fs->err = HR_FILES_ERR_NONE;
     fs->transfers++;
@@ -322,13 +366,18 @@ bool hr_files_start_read(hr_files_t *fs, const char *name, long expected_size,
     }
     strcpy(fs->name, name);
     fs->block = 0;
+    fs->next_req = 0;
     fs->size = expected_size;
     fs->received = 0;
     fs->retries = 0;
     fs->awaiting = false;
+    fs->inflight = 0;
+    fs->eof = false;
+    fs->first_sent = false;
     fs->paused = false;
     fs->pending = true;
     fs->started_ms = now_ms;
+    fs->t_first_ms = fs->t_dryer_ms = fs->t_paused_ms = 0;
     fs->state = HR_FILES_READING;
     fs->err = HR_FILES_ERR_NONE;
     fs->transfers++;
@@ -399,7 +448,6 @@ void hr_files_on_block(hr_files_t *fs, const char *frame, size_t len,
         fs->blocks_bad++;
         return; /* unparsable: let the timeout re-ask */
     }
-    fs->awaiting = false;
 
     /* "FDFILEBLOCK,,0,0,0,00": the dryer could not open the file. */
     if (b.name[0] == '\0' && b.size == 0 && b.nbytes == 0) {
@@ -407,18 +455,42 @@ void hr_files_on_block(hr_files_t *fs, const char *frame, size_t len,
         return;
     }
     if (strcmp(b.name, fs->name) != 0 || b.block != fs->block) {
-        /* Belongs to something else - a stale reply. Re-ask ours. */
+        /*
+         * Not the block we expect next: a stale reply, a duplicate, or -
+         * while pipelining - the answer to a request the dryer skipped.
+         * Whatever is in flight is now suspect: forget the window and ask
+         * again from the expected block. Bounded, so a dryer answering
+         * nonsense forever cannot keep the machine READING.
+         */
         fs->blocks_bad++;
-        fs->pending = true;
+        if (++fs->retries > fs->max_retries * 3) {
+            finish(fs, HR_FILES_ERROR, HR_FILES_ERR_MISMATCH, now_ms);
+            return;
+        }
+        rewind_window(fs);
+        if (fs->send_inline) {
+            maybe_send(fs, now_ms);
+        }
         return;
     }
+    /* The reply we were waiting for. Account the wait to the dryer. */
+    fs->t_dryer_ms += (long)(now_ms - fs->sent_ms) > 0 ? now_ms - fs->sent_ms : 0;
+    if (fs->inflight > 0) {
+        fs->inflight--;
+    }
+    fs->awaiting = (fs->inflight > 0);
+    fs->sent_ms = now_ms; /* the next outstanding reply is timed from here */
+
     if (!b.sum_ok) {
         fs->blocks_bad++;
         if (++fs->retries > fs->max_retries) {
             finish(fs, HR_FILES_ERROR, HR_FILES_ERR_CHECKSUM, now_ms);
             return;
         }
-        fs->pending = true; /* same block again */
+        rewind_window(fs); /* same block again (and the window after it) */
+        if (fs->send_inline) {
+            maybe_send(fs, now_ms);
+        }
         return;
     }
     fs->retries = 0;
@@ -439,18 +511,27 @@ void hr_files_on_block(hr_files_t *fs, const char *frame, size_t len,
     }
     fs->received += b.nbytes;
     fs->block++;
+    if (fs->next_req < fs->block) {
+        fs->next_req = fs->block;
+    }
 
-    const bool eof = (b.nbytes < HR_FDBLOCK_SIZE) ||
-                     (fs->size > 0 && fs->received >= fs->size);
+    fs->eof = (b.nbytes < HR_FDBLOCK_SIZE) ||
+              (fs->size > 0 && fs->received >= fs->size);
     if (verdict == HR_FILES_SINK_WAIT) {
-        /* Nothing goes out until the sink has stored this block. With eof
-         * there is nothing more to ask for: resume() then finishes. */
-        fs->paused = true;
-        fs->paused_ms = now_ms;
-        fs->pending = !eof;
+        /*
+         * No NEW request goes out until the sink has made room; replies
+         * already in flight are still accepted (the sink promised room for
+         * them when it chose a depth). With eof there is nothing more to
+         * ask for: resume() then finishes.
+         */
+        if (!fs->paused) {
+            fs->paused = true;
+            fs->paused_ms = now_ms;
+        }
+        fs->pending = !fs->eof;
         return;
     }
-    if (eof) {
+    if (fs->eof) {
         finish(fs, HR_FILES_DONE, HR_FILES_ERR_NONE, now_ms);
         return;
     }
@@ -466,7 +547,9 @@ void hr_files_resume(hr_files_t *fs, unsigned long now_ms)
         return;
     }
     fs->paused = false;
-    if (fs->state == HR_FILES_READING && !fs->pending && !fs->awaiting) {
+    fs->t_paused_ms += (long)(now_ms - fs->paused_ms) > 0
+                           ? now_ms - fs->paused_ms : 0;
+    if (fs->state == HR_FILES_READING && fs->eof && fs->inflight == 0) {
         /* the block the sink just stored was the last one */
         finish(fs, HR_FILES_DONE, HR_FILES_ERR_NONE, now_ms);
         return;
@@ -476,7 +559,7 @@ void hr_files_resume(hr_files_t *fs, unsigned long now_ms)
     }
 }
 
-static bool send_request(hr_files_t *fs)
+static bool send_request(hr_files_t *fs, long block)
 {
     char idx[16];
     bool ok;
@@ -485,27 +568,89 @@ static bool send_request(hr_files_t *fs)
         ok = fs->send != NULL &&
              fs->send("FDFILES", fs->pattern, idx, fs->send_user);
     } else {
-        snprintf(idx, sizeof(idx), "%ld", fs->block);
+        snprintf(idx, sizeof(idx), "%ld", block);
         ok = fs->send != NULL &&
              fs->send("FILEREAD", fs->name, idx, fs->send_user);
     }
     return ok;
 }
 
-/* Put the pending request on the wire, if there is one and nothing holds it. */
+/* One request on the wire; false (and the transfer failed) if it did not go. */
+static bool put_request(hr_files_t *fs, long block, unsigned long now_ms)
+{
+    if (!fs->first_sent) {
+        fs->first_sent = true;
+        fs->t_first_ms = (long)(now_ms - fs->started_ms) > 0
+                             ? now_ms - fs->started_ms : 0;
+    }
+    fs->requests++;
+    if (!send_request(fs, block)) {
+        finish(fs, HR_FILES_ERROR, HR_FILES_ERR_SEND, now_ms);
+        return false;
+    }
+    if (fs->inflight == 0) {
+        fs->sent_ms = now_ms; /* first of the window: timeouts count from it */
+    }
+    fs->inflight++;
+    fs->awaiting = true;
+    fs->last_send_ms = now_ms;
+    return true;
+}
+
+/* Put the pending request(s) on the wire, as many as the depth, the file's
+ * size and the pacing gap allow. */
 static void maybe_send(hr_files_t *fs, unsigned long now_ms)
 {
-    if (!hr_files_busy(fs) || fs->awaiting || fs->paused || !fs->pending) {
+    if (!hr_files_busy(fs) || fs->paused || !fs->pending) {
         return;
     }
-    fs->pending = false;
-    fs->requests++;
-    if (!send_request(fs)) {
-        finish(fs, HR_FILES_ERROR, HR_FILES_ERR_SEND, now_ms);
+    if (fs->state == HR_FILES_LISTING) {
+        if (fs->awaiting) {
+            return;
+        }
+        if (fs->gap_ms && fs->requests &&
+            (long)(now_ms - fs->last_send_ms) < (long)fs->gap_ms) {
+            return; /* tick() will */
+        }
+        fs->pending = false;
+        put_request(fs, 0, now_ms);
         return;
     }
-    fs->awaiting = true;
-    fs->sent_ms = now_ms;
+    /* READING */
+    if (fs->eof) {
+        fs->pending = false;
+        return;
+    }
+    while (fs->inflight < fs->depth) {
+        const long limit = block_limit(fs);
+        if (limit < 0) {
+            /* size unknown: one at a time until the first block says */
+            if (fs->inflight > 0) {
+                break;
+            }
+        } else if (fs->next_req >= limit) {
+            break; /* everything the file has is asked for */
+        }
+        if (fs->gap_ms && fs->requests &&
+            (long)(now_ms - fs->last_send_ms) < (long)fs->gap_ms) {
+            return; /* held back; tick() sends it, pending stays set */
+        }
+        if (!put_request(fs, fs->next_req, now_ms)) {
+            return;
+        }
+        fs->next_req++;
+    }
+    /* pending stays true while there are blocks left to ask for */
+    fs->pending = (block_limit(fs) < 0) ? (fs->inflight == 0)
+                                        : (fs->next_req < block_limit(fs));
+}
+
+void hr_files_kick(hr_files_t *fs, unsigned long now_ms)
+{
+    if (fs == NULL) {
+        return;
+    }
+    maybe_send(fs, now_ms);
 }
 
 void hr_files_tick(hr_files_t *fs, unsigned long now_ms, bool link_up)
@@ -524,14 +669,24 @@ void hr_files_tick(hr_files_t *fs, unsigned long now_ms, bool link_up)
          * pattern re-asked one block in every twenty on the real board. */
         if ((long)(now_ms - fs->sent_ms) >= (long)fs->timeout_ms) {
             fs->timeouts++;
-            fs->awaiting = false;
             if (++fs->retries > fs->max_retries) {
                 finish(fs, HR_FILES_ERROR, HR_FILES_ERR_TIMEOUT, now_ms);
                 return;
             }
-            fs->pending = true;
+            if (fs->state == HR_FILES_READING) {
+                rewind_window(fs);
+            } else {
+                fs->awaiting = false;
+                fs->inflight = 0;
+                fs->pending = true;
+            }
+        } else if (fs->state == HR_FILES_READING && !fs->paused &&
+                   fs->pending && fs->inflight < fs->depth) {
+            maybe_send(fs, now_ms); /* a request the gap held back */
+            return;
+        } else {
+            return;
         }
-        return;
     }
     if (fs->paused) {
         /* A sink that never resumes must not leave the machine READING for
@@ -771,4 +926,70 @@ long hr_csv_row_minutes(const hr_csv_row_t *row)
         days += 1;
     }
     return (days * 24 + row->hour) * 60 + row->minute;
+}
+
+/* ------------------------------------------------------------------ */
+/* HRTempFC.txt                                                        */
+/* ------------------------------------------------------------------ */
+static bool has_word_ci(const char *s, size_t n, const char *word)
+{
+    size_t wl = strlen(word);
+    for (size_t i = 0; i + wl <= n; i++) {
+        size_t k = 0;
+        while (k < wl) {
+            char a = s[i + k], b = word[k];
+            if (a >= 'A' && a <= 'Z') {
+                a = (char)(a - 'A' + 'a');
+            }
+            if (b >= 'A' && b <= 'Z') {
+                b = (char)(b - 'A' + 'a');
+            }
+            if (a != b) {
+                break;
+            }
+            k++;
+        }
+        if (k == wl) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int hr_tempfc_parse(const char *data, size_t n)
+{
+    if (data == NULL) {
+        return HR_TEMP_DRYER_UNKNOWN;
+    }
+    /* trim whitespace, NULs and the dryer's line ends at both ends */
+    while (n > 0 && ((unsigned char)data[0] <= 0x20)) {
+        data++;
+        n--;
+    }
+    while (n > 0 && ((unsigned char)data[n - 1] <= 0x20)) {
+        n--;
+    }
+    if (n == 0 || n > 64) {
+        return HR_TEMP_DRYER_UNKNOWN;
+    }
+    /* an empty data-flash record echoes the dryer's transmit buffer */
+    if (n >= 11 && memcmp(data, "FDFILEBLOCK", 11) == 0) {
+        return HR_TEMP_DRYER_UNKNOWN;
+    }
+    const bool c = has_word_ci(data, n, "celsius");
+    const bool f = has_word_ci(data, n, "fahrenheit");
+    if (c && !f) {
+        return HR_TEMP_C;
+    }
+    if (f && !c) {
+        return HR_TEMP_F;
+    }
+    if (c && f) {
+        return HR_TEMP_DRYER_UNKNOWN; /* both words: not the record we know */
+    }
+    /* No word: fall back to the flag, "<0|1>," - 0 was Celsius live. */
+    if (n >= 2 && data[1] == ',' && (data[0] == '0' || data[0] == '1')) {
+        return data[0] == '0' ? HR_TEMP_C : HR_TEMP_F;
+    }
+    return HR_TEMP_DRYER_UNKNOWN;
 }

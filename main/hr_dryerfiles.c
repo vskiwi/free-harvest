@@ -3,7 +3,9 @@
  */
 #include "hr_dryerfiles.h"
 
+#include "hr_batchstore.h"   /* hr_time_now(): wall clock for the sync stamp */
 #include "hr_capture.h"
+#include "hr_units.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -18,23 +20,36 @@
 
 static const char *TAG = "hr_files";
 
-#define NVS_NS   "hrfiles"
-#define NVS_KEY  "on"
+#define NVS_NS    "hrfiles"
+#define NVS_KEY   "on"
+#define NVS_DEPTH "depth"    /* u8 */
+#define NVS_GAP   "gap"      /* u16, ms */
+
+#ifndef CONFIG_HR_FILES_PIPELINE_DEPTH
+#define CONFIG_HR_FILES_PIPELINE_DEPTH 1
+#endif
+#ifndef CONFIG_HR_FILES_REQ_GAP_MS
+#define CONFIG_HR_FILES_REQ_GAP_MS 0
+#endif
 
 static hr_session_t *s_session;
 static SemaphoreHandle_t s_lock;
 static hr_files_t s_fs;
 static bool s_enabled;
+static int s_depth = CONFIG_HR_FILES_PIPELINE_DEPTH;
+static unsigned long s_gap_ms = CONFIG_HR_FILES_REQ_GAP_MS;
 
 /* The stream's side buffer for whole FDFILEBLOCK frames (hr_big_cb). */
 static char s_big[HR_FILES_BIGBUF];
 
 /*
  * Blocks accumulate here (USB RX task, the sink) until the HTTP handler
- * takes them (hr_dryerfiles_take_chunk). The machine pauses when the buffer
- * has no room for another block and resumes when it is emptied, so the
- * dryer is asked for exactly as much as the browser is taking. Allocated
- * for the transfer, freed when the last chunk has been taken.
+ * takes them (hr_dryerfiles_take_chunk). A ring in effect: the handler
+ * takes whatever has arrived once HR_DF_CHUNK_MIN_BLOCKS are in (or the
+ * transfer ended) while the machine keeps asking; the machine is told to
+ * WAIT only when fewer than `depth` blocks of room remain - the replies
+ * already in flight still fit - and resumes as soon as a take makes room.
+ * Allocated for the transfer, freed when the last chunk has been taken.
  */
 #define CHUNK_CAP (HR_DF_CHUNK_BLOCKS * HR_FDBLOCK_SIZE)
 static struct {
@@ -44,6 +59,27 @@ static struct {
     bool ended;             /* machine finished (done or error) */
     hr_files_err_t err;
 } s_chunk;
+
+/*
+ * The panel-unit sync: an internal read of HRTempFC.txt whose block lands
+ * in this small buffer instead of the chunk buffer, parsed when the
+ * machine finishes and applied to hr_units from a task that may write NVS.
+ */
+#define UNIT_FILE       "HRTempFC.txt"
+#define UNIT_RETRY_MS   30000UL
+#define UNIT_ATTEMPTS   2
+static struct {
+    bool active;            /* the machine is reading UNIT_FILE for us */
+    bool apply;             /* a read finished; poll() applies `parsed` */
+    int parsed;             /* HR_TEMP_F / HR_TEMP_C / HR_TEMP_DRYER_UNKNOWN */
+    bool parsed_ok;
+    unsigned long due_ms;   /* 0 = nothing scheduled */
+    int attempts;
+    char buf[64];
+    size_t len;
+    const char *why;
+    unsigned long syncs, fails;
+} s_unit;
 
 /* Last list from the dryer. */
 static hr_df_entry_t s_list[HR_DF_LIST_MAX];
@@ -107,14 +143,6 @@ static bool cb_send(const char *verb, const char *a1, const char *a2, void *u)
 static int cb_sink(const hr_fdblock_t *b, void *u)
 {
     (void)u;
-    if (s_chunk.buf == NULL || s_chunk.full ||
-        s_chunk.len + (size_t)b->nbytes > CHUNK_CAP) {
-        return HR_FILES_SINK_FAIL; /* cannot happen: the machine waits */
-    }
-    memcpy(s_chunk.buf + s_chunk.len, b->data, (size_t)b->nbytes);
-    hr_fdblock_unbel(s_chunk.buf + s_chunk.len, (size_t)b->nbytes);
-    s_chunk.len += (size_t)b->nbytes;
-
     /* A one-line note per block in the capture, since the data itself never
      * goes through the frame path. */
     char note[96];
@@ -122,8 +150,27 @@ static int cb_sink(const hr_fdblock_t *b, void *u)
              b->name, b->nbytes, b->block, b->size, b->sum);
     hr_capture_append_dir((uint32_t)now_ms(), HR_CAP_DIR_RX, note);
 
-    if (s_chunk.len + HR_FDBLOCK_SIZE > CHUNK_CAP) {
-        s_chunk.full = true;        /* no room for another: hand it out */
+    if (s_unit.active) {
+        /* the 11-byte panel-unit record; anything bigger is not it */
+        size_t room = sizeof(s_unit.buf) - 1 - s_unit.len;
+        size_t n = (size_t)b->nbytes < room ? (size_t)b->nbytes : room;
+        memcpy(s_unit.buf + s_unit.len, b->data, n);
+        s_unit.len += n;
+        s_unit.buf[s_unit.len] = '\0';
+        return HR_FILES_SINK_OK;
+    }
+    if (s_chunk.buf == NULL || s_chunk.len + (size_t)b->nbytes > CHUNK_CAP) {
+        return HR_FILES_SINK_FAIL; /* cannot happen: the machine waits */
+    }
+    memcpy(s_chunk.buf + s_chunk.len, b->data, (size_t)b->nbytes);
+    hr_fdblock_unbel(s_chunk.buf + s_chunk.len, (size_t)b->nbytes);
+    s_chunk.len += (size_t)b->nbytes;
+
+    /* Room for the replies still in flight (depth - 1) plus one more
+     * request? If not, ask for nothing new until the handler takes some. */
+    size_t need = (size_t)s_fs.depth * HR_FDBLOCK_SIZE;
+    if (CHUNK_CAP - s_chunk.len < need) {
+        s_chunk.full = true;
         return HR_FILES_SINK_WAIT;
     }
     return HR_FILES_SINK_OK;
@@ -148,18 +195,33 @@ static void cb_list(const hr_fdlist_entry_t *e, void *u)
 static void cb_done(hr_files_state_t st, hr_files_err_t err, void *u)
 {
     (void)u;
-    if (s_chunk.buf != NULL) {
+    if (s_unit.active) {
+        /* USB task: parse here (pure C), apply from poll() (writes NVS). */
+        s_unit.active = false;
+        if (st == HR_FILES_DONE) {
+            s_unit.parsed = hr_tempfc_parse(s_unit.buf, s_unit.len);
+            s_unit.parsed_ok = (s_unit.parsed != HR_TEMP_DRYER_UNKNOWN);
+        } else {
+            s_unit.parsed = HR_TEMP_DRYER_UNKNOWN;
+            s_unit.parsed_ok = false;
+        }
+        s_unit.apply = true;
+    } else if (s_chunk.buf != NULL) {
         s_chunk.ended = true;
         s_chunk.err = (st == HR_FILES_DONE) ? HR_FILES_ERR_NONE : err;
     }
     ESP_LOGI(TAG, "transfer %s%s%s: %ld bytes in %lu ms (%lu requests, "
-                  "%lu blocks, %lu bad, %lu timeouts)",
+                  "%lu blocks, %lu bad, %lu timeouts; first req %lu ms, "
+                  "dryer %lu ms, paused for consumer %lu ms, depth %d)",
              hr_files_state_str(st), err ? ": " : "", hr_files_err_str(err),
              s_fs.received, now_ms() - s_fs.started_ms, s_fs.requests,
-             s_fs.blocks_ok, s_fs.blocks_bad, s_fs.timeouts);
-    hr_capture_event("files %s %s %s %ld B %lu ms", hr_files_state_str(st),
+             s_fs.blocks_ok, s_fs.blocks_bad, s_fs.timeouts, s_fs.t_first_ms,
+             s_fs.t_dryer_ms, s_fs.t_paused_ms, s_fs.depth);
+    hr_capture_event("files %s %s %s %ld B %lu ms first=%lu dryer=%lu "
+                     "paused=%lu depth=%d", hr_files_state_str(st),
                      hr_files_err_str(err), s_fs.name, s_fs.received,
-                     now_ms() - s_fs.started_ms);
+                     now_ms() - s_fs.started_ms, s_fs.t_first_ms,
+                     s_fs.t_dryer_ms, s_fs.t_paused_ms, s_fs.depth);
 }
 
 /* ------------------------------------------------------------------ */
@@ -194,25 +256,70 @@ void hr_dryerfiles_init(hr_session_t *s)
 #else
     bool on = false;
 #endif
-    const char *src = "kconfig";
+    const char *src = "kconfig", *psrc = "kconfig";
     nvs_handle_t nh;
     if (nvs_open(NVS_NS, NVS_READONLY, &nh) == ESP_OK) {
         uint8_t v = 0;
+        uint16_t g = 0;
         if (nvs_get_u8(nh, NVS_KEY, &v) == ESP_OK) {
             on = (v != 0);
             src = "nvs";
         }
+        if (nvs_get_u8(nh, NVS_DEPTH, &v) == ESP_OK && v >= 1 &&
+            v <= HR_FILES_DEPTH_MAX) {
+            s_depth = v;
+            psrc = "nvs";
+        }
+        if (nvs_get_u16(nh, NVS_GAP, &g) == ESP_OK && g <= 5000) {
+            s_gap_ms = g;
+            psrc = "nvs";
+        }
         nvs_close(nh);
     }
     s_enabled = on;
+    hr_files_set_pacing(&s_fs, s_depth, s_gap_ms);
+    s_depth = s_fs.depth;
 
     /* The side buffer is lent regardless of the switch: with it the stream
      * collects blocks whole; without it, it swallows them. Either way no
      * block data can ever be mistaken for frames. Requests are what the
      * switch gates. */
     hr_session_set_block_sink(s, s_big, sizeof(s_big), on_block, NULL);
-    ESP_LOGI(TAG, "batch history (dryer files): %s (%s); side buffer %u B",
-             on ? "ON" : "off", src, (unsigned)sizeof(s_big));
+    ESP_LOGI(TAG, "batch history (dryer files): %s (%s); side buffer %u B; "
+                  "pipeline depth %d, gap %lu ms (%s)",
+             on ? "ON" : "off", src, (unsigned)sizeof(s_big), s_depth,
+             s_gap_ms, psrc);
+}
+
+void hr_dryerfiles_pacing(int *depth, unsigned long *gap_ms)
+{
+    if (depth) *depth = s_depth;
+    if (gap_ms) *gap_ms = s_gap_ms;
+}
+
+bool hr_dryerfiles_set_pacing(int depth, unsigned long gap_ms)
+{
+    if (s_lock == NULL || depth < 1 || depth > HR_FILES_DEPTH_MAX ||
+        gap_ms > 5000) {
+        return false;
+    }
+    LOCK();
+    hr_files_set_pacing(&s_fs, depth, gap_ms);
+    s_depth = s_fs.depth;
+    s_gap_ms = gap_ms;
+    UNLOCK();
+    nvs_handle_t nh;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &nh) != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed; pacing not persisted");
+        return false;
+    }
+    bool ok = nvs_set_u8(nh, NVS_DEPTH, (uint8_t)depth) == ESP_OK &&
+              nvs_set_u16(nh, NVS_GAP, (uint16_t)gap_ms) == ESP_OK &&
+              nvs_commit(nh) == ESP_OK;
+    nvs_close(nh);
+    ESP_LOGW(TAG, "pacing set: depth %d, gap %lu ms%s", depth, gap_ms,
+             ok ? "" : " (NOT persisted)");
+    return ok;
 }
 
 bool hr_dryerfiles_enabled(void)
@@ -251,6 +358,28 @@ void hr_dryerfiles_on_frame(const hr_frame_t *f)
     UNLOCK();
 }
 
+/* Under the lock. Start the internal HRTempFC.txt read if nothing is in the
+ * way; true if it went out. */
+static bool unit_start_locked(unsigned long now)
+{
+    if (!s_enabled || !s_link_up || hr_files_busy(&s_fs) ||
+        s_chunk.buf != NULL || s_unit.active || s_unit.apply) {
+        return false;
+    }
+    s_unit.len = 0;
+    s_unit.buf[0] = '\0';
+    if (!hr_files_start_read(&s_fs, UNIT_FILE, -1, now)) {
+        return false;
+    }
+    s_unit.active = true;
+    s_unit.due_ms = 0;
+    s_unit.attempts++;
+    hr_files_kick(&s_fs, now);
+    hr_capture_event("unit sync read %s (%s, attempt %d)", UNIT_FILE,
+                     s_unit.why ? s_unit.why : "?", s_unit.attempts);
+    return true;
+}
+
 void hr_dryerfiles_tick(unsigned long t, bool link_up, bool dryer_running)
 {
     if (s_lock == NULL) {
@@ -261,8 +390,121 @@ void hr_dryerfiles_tick(unsigned long t, bool link_up, bool dryer_running)
     LOCK();
     s_link_up = link_up;
     s_running = dryer_running;
-    hr_files_tick(&s_fs, now_ms(), link_up);
+    unsigned long now = now_ms();
+    hr_files_tick(&s_fs, now, link_up);
+    if (!link_up) {
+        s_unit.due_ms = 0; /* the next link-up schedules its own */
+    } else if (s_unit.due_ms != 0 && (long)(now - s_unit.due_ms) >= 0) {
+        unit_start_locked(now);
+    }
     UNLOCK();
+    hr_dryerfiles_unit_sync_poll();
+}
+
+void hr_dryerfiles_unit_sync_schedule(unsigned long delay_ms, const char *why)
+{
+#if !CONFIG_HR_FILES_UNIT_SYNC
+    (void)delay_ms;
+    (void)why;
+    return;
+#else
+    if (s_lock == NULL) {
+        return;
+    }
+    LOCK();
+    unsigned long due = now_ms() + delay_ms;
+    if (due == 0) {
+        due = 1;
+    }
+    s_unit.due_ms = due;
+    s_unit.attempts = 0;
+    s_unit.why = why;
+    UNLOCK();
+    ESP_LOGI(TAG, "panel unit sync in %lu ms (%s)", delay_ms, why ? why : "");
+#endif
+}
+
+hr_df_result_t hr_dryerfiles_unit_sync_now(void)
+{
+    if (s_lock == NULL || !s_enabled) {
+        return HR_DF_DISABLED;
+    }
+    hr_df_result_t r = HR_DF_OK;
+    LOCK();
+    if (!s_link_up) {
+        r = HR_DF_LINK;
+    } else if (hr_files_busy(&s_fs) || s_chunk.buf != NULL || s_unit.active) {
+        r = HR_DF_BUSY;
+    } else {
+        s_unit.attempts = 0;
+        s_unit.why = "manual";
+        if (!unit_start_locked(now_ms())) {
+            r = HR_DF_BUSY;
+        }
+    }
+    UNLOCK();
+    return r;
+}
+
+void hr_dryerfiles_unit_sync_poll(void)
+{
+    if (s_lock == NULL) {
+        return;
+    }
+    bool apply;
+    int parsed;
+    bool ok;
+    char rec[sizeof(s_unit.buf)];
+    LOCK();
+    apply = s_unit.apply;
+    parsed = s_unit.parsed;
+    ok = s_unit.parsed_ok;
+    memcpy(rec, s_unit.buf, sizeof(rec));
+    if (apply) {
+        s_unit.apply = false;
+        if (ok) {
+            s_unit.syncs++;
+            s_unit.attempts = 0;
+        } else {
+            s_unit.fails++;
+            if (s_unit.attempts < UNIT_ATTEMPTS) {
+                s_unit.due_ms = now_ms() + UNIT_RETRY_MS;
+            }
+        }
+    }
+    UNLOCK();
+    if (!apply) {
+        return;
+    }
+    /* printable copy of the record for the log */
+    for (char *p = rec; *p; p++) {
+        if ((unsigned char)*p < 0x20 || (unsigned char)*p >= 0x7f) {
+            *p = '.';
+        }
+    }
+    if (ok) {
+        uint32_t epoch = hr_time_known() ? hr_time_now() : 0;
+        hr_units_set_dryer_unit(parsed, epoch);
+        hr_capture_event("unit sync ok %s -> %s", rec,
+                         parsed == HR_TEMP_C ? "C" : "F");
+    } else {
+        ESP_LOGW(TAG, "panel unit sync failed (%s): record \"%s\"%s",
+                 hr_files_err_str(s_fs.err), rec,
+                 s_unit.attempts < UNIT_ATTEMPTS ? "; retry in 30 s" : "");
+        hr_capture_event("unit sync failed %s \"%s\"",
+                         hr_files_err_str(s_fs.err), rec);
+    }
+}
+
+bool hr_dryerfiles_unit_sync_busy(void)
+{
+    if (s_lock == NULL) {
+        return false;
+    }
+    LOCK();
+    bool b = s_unit.active || s_unit.apply || s_unit.due_ms != 0;
+    UNLOCK();
+    return b;
 }
 
 static hr_df_result_t precheck(bool force)
@@ -270,7 +512,7 @@ static hr_df_result_t precheck(bool force)
     if (!s_enabled) {
         return HR_DF_DISABLED;
     }
-    if (hr_files_busy(&s_fs) || s_chunk.buf != NULL) {
+    if (hr_files_busy(&s_fs) || s_chunk.buf != NULL || s_unit.active) {
         return HR_DF_BUSY;
     }
     if (!s_link_up) {
@@ -297,6 +539,8 @@ hr_df_result_t hr_dryerfiles_refresh(const char *pattern, bool force)
         s_list_valid = false;
         if (!hr_files_start_list(&s_fs, pattern, now_ms())) {
             r = HR_DF_BADNAME;
+        } else {
+            hr_files_kick(&s_fs, now_ms()); /* first request now, not next tick */
         }
     }
     UNLOCK();
@@ -342,6 +586,12 @@ hr_df_result_t hr_dryerfiles_fetch(const char *name, bool force)
                                                     : HR_DF_BADNAME;
             free(s_chunk.buf);
             s_chunk.buf = NULL;
+        } else {
+            /* The first FILEREAD goes out from here (the httpd task; the
+             * USB transport is mutex-protected) rather than from the main
+             * loop's next tick, which measured up to 5 s away after a
+             * flash write - most of a 6 KB file's total time. */
+            hr_files_kick(&s_fs, now_ms());
         }
     }
     UNLOCK();
@@ -370,24 +620,27 @@ size_t hr_dryerfiles_take_chunk(char *out, size_t cap, bool *done,
     if (s_chunk.buf == NULL) {
         fin = true;
         e = s_fs.err;
-    } else if (s_chunk.full || s_chunk.ended) {
-        /* a full buffer, or the tail after the machine finished */
+    } else if (s_chunk.full || s_chunk.ended ||
+               s_chunk.len >= HR_DF_CHUNK_MIN_BLOCKS * HR_FDBLOCK_SIZE) {
+        /* enough to be worth a TCP write, a full buffer, or the tail after
+         * the machine finished - hand it out while the dryer keeps going */
         n = s_chunk.len < cap ? s_chunk.len : cap;
         memcpy(out, s_chunk.buf, n);
         if (n < s_chunk.len) {
             memmove(s_chunk.buf, s_chunk.buf + n, s_chunk.len - n);
         }
         s_chunk.len -= n;
-        if (s_chunk.len == 0) {
-            if (s_chunk.ended) {
-                fin = true;
-                e = s_chunk.err;
-                free(s_chunk.buf);
-                s_chunk.buf = NULL;
-            } else if (s_chunk.full) {
-                s_chunk.full = false;
-                hr_files_resume(&s_fs, now_ms());
-            }
+        if (s_chunk.len == 0 && s_chunk.ended) {
+            fin = true;
+            e = s_chunk.err;
+            free(s_chunk.buf);
+            s_chunk.buf = NULL;
+        } else if (s_chunk.full &&
+                   CHUNK_CAP - s_chunk.len >=
+                       (size_t)(s_fs.depth + 1) * HR_FDBLOCK_SIZE) {
+            /* room again for the window plus one: let the machine ask */
+            s_chunk.full = false;
+            hr_files_resume(&s_fs, now_ms());
         }
     }
     UNLOCK();
@@ -402,6 +655,11 @@ void hr_dryerfiles_cancel(void)
         return;
     }
     LOCK();
+    if (s_unit.active) {
+        /* the unit read is internal; a cancel from the UI ends it quietly */
+        s_unit.active = false;
+        s_unit.apply = false;
+    }
     hr_files_cancel(&s_fs, HR_FILES_ERR_CANCEL, now_ms());
     free(s_chunk.buf);
     s_chunk.buf = NULL;
@@ -448,6 +706,16 @@ void hr_dryerfiles_snapshot(hr_df_snapshot_t *out)
     out->transfers = s_fs.transfers;
     out->blocks_in = s_session ? s_session->blocks_in : 0;
     out->big_dropped = s_session ? s_session->stream.big_dropped : 0;
+    out->depth = s_fs.depth;
+    out->gap_ms = s_fs.gap_ms;
+    out->t_first_ms = s_fs.t_first_ms;
+    out->t_dryer_ms = s_fs.t_dryer_ms;
+    out->t_paused_ms = s_fs.t_paused_ms;
+    out->unit_syncs = s_unit.syncs;
+    out->unit_sync_fails = s_unit.fails;
+    out->unit_state = s_unit.active ? "reading"
+                      : s_unit.apply ? "applying"
+                      : s_unit.due_ms ? "due" : "idle";
     UNLOCK();
 }
 
@@ -464,16 +732,20 @@ int hr_dryerfiles_state_json(char *out, size_t cap)
     hr_files_err_t err = s_fs.err;
     unsigned long req = s_fs.requests, to = s_fs.timeouts,
                   ok = s_fs.blocks_ok, bad = s_fs.blocks_bad,
-                  tr = s_fs.transfers;
+                  tr = s_fs.transfers, us = s_unit.syncs, uf = s_unit.fails;
+    int depth = s_fs.depth;
     bool en = s_enabled;
     UNLOCK();
     int n = snprintf(out, cap,
                      "\"files_enabled\":%s,\"files_state\":\"%s\","
                      "\"files_error\":\"%s\",\"files_requests\":%lu,"
                      "\"files_timeouts\":%lu,\"files_blocks_ok\":%lu,"
-                     "\"files_blocks_bad\":%lu,\"files_transfers\":%lu,",
+                     "\"files_blocks_bad\":%lu,\"files_transfers\":%lu,"
+                     "\"files_depth\":%d,\"unit_syncs\":%lu,"
+                     "\"unit_sync_fails\":%lu,",
                      en ? "true" : "false", hr_files_state_str(st),
-                     hr_files_err_str(err), req, to, ok, bad, tr);
+                     hr_files_err_str(err), req, to, ok, bad, tr, depth, us,
+                     uf);
     return (n < 0 || (size_t)n >= cap) ? 0 : n;
 }
 

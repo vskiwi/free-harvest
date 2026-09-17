@@ -78,6 +78,12 @@ static long s_last_batch_elapsed = -1;
  * this callback must not touch flash.
  */
 static volatile bool s_compat_auto_req;
+#if CONFIG_HR_BATCH_HISTORY
+/* A batch just started (USB RX task saw the phase go running): the main
+ * loop re-reads the dryer's panel unit, in case the owner changed it while
+ * loading trays. */
+static volatile bool s_unit_sync_req;
+#endif
 
 /*
  * Batch logbook.
@@ -304,6 +310,9 @@ static void on_inbound(const hr_frame_t *f, void *user)
         const bool went_back = (s_last_batch_elapsed >= 0 &&
                                 tel.batch_elapsed_s < s_last_batch_elapsed);
         if ((running_now && !s_last_running) || (running_now && went_back)) {
+#if CONFIG_HR_BATCH_HISTORY
+            s_unit_sync_req = true;
+#endif
             hr_trend_reset(&s_trend);
             s_trend_persisted = 0;
             /*
@@ -728,6 +737,11 @@ void app_main(void)
                 }
                 s_hello_step = HR_HELLO_STEPS;
                 s_heartbeat_ms = (uint32_t)now_ms();
+#if CONFIG_HR_BATCH_HISTORY
+                /* Once the dryer has answered the hello (SNM/CFG/UID come
+                 * within a second), one FILEREAD for its panel unit. */
+                hr_dryerfiles_unit_sync_schedule(4000, "link up");
+#endif
             } else if ((uint32_t)now_ms() - s_heartbeat_ms > 15000u) {
                 s_heartbeat_ms = (uint32_t)now_ms();
                 hr_session_heartbeat(&s_session);
@@ -904,6 +918,10 @@ void app_main(void)
             xSemaphoreTake(s_hist_lock, portMAX_DELAY);
             const bool running = s_last_running;
             xSemaphoreGive(s_hist_lock);
+            if (s_unit_sync_req) {
+                s_unit_sync_req = false;
+                hr_dryerfiles_unit_sync_schedule(2000, "batch start");
+            }
             hr_dryerfiles_tick(t, s_session.link == HR_LINK_UP, running);
         }
 #endif

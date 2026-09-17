@@ -20,6 +20,7 @@
  */
 #include "hr_enc.h"
 #include "hr_files.h"
+#include "hr_temp.h"
 #include "hr_session.h"
 #include "test_util.h"
 
@@ -855,6 +856,244 @@ static void test_sm_timeouts_and_link(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Pipelining, kick, pacing, timing                                    */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    harness_t h;
+    long asked[64];
+    int nasked;
+} pipe_harness_t;
+
+static bool p_send(const char *verb, const char *a1, const char *a2, void *u)
+{
+    pipe_harness_t *p = (pipe_harness_t *)u;
+    bool ok = h_send(verb, a1, a2, &p->h);
+    if (strcmp(verb, "FILEREAD") == 0 && p->nasked < 64) {
+        p->asked[p->nasked++] = atol(a2);
+    }
+    return ok;
+}
+
+static void psetup(hr_files_t *fs, pipe_harness_t *p)
+{
+    memset(p, 0, sizeof(*p));
+    hr_files_init(fs, p_send, p);
+    hr_files_set_sink(fs, h_sink, &p->h);
+    hr_files_set_done_cb(fs, h_done, &p->h);
+    fs->send_inline = true;
+}
+
+static void test_sm_pipeline(void)
+{
+    hr_files_t fs;
+    pipe_harness_t p;
+    char d[1024];
+    memset(d, 'P', sizeof(d));
+    const char *name = "42838.2026-09-05_07.51.csv";
+
+    TEST_CASE("kick: the first request goes out from the caller, not the tick");
+    psetup(&fs, &p);
+    CHECK(hr_files_start_read(&fs, name, 5934, 1000));
+    CHECK_INT(p.h.sends, 0);
+    hr_files_kick(&fs, 1120);
+    CHECK_INT(p.h.sends, 1);
+    CHECK_INT(p.asked[0], 0);
+    CHECK_INT(fs.t_first_ms, 120);
+    hr_files_tick(&fs, 1200, true);        /* nothing more at depth 1 */
+    CHECK_INT(p.h.sends, 1);
+
+    TEST_CASE("depth 2: two FILEREADs in flight, size known from the list");
+    psetup(&fs, &p);
+    hr_files_set_pacing(&fs, 2, 0);
+    CHECK_INT(fs.depth, 2);
+    CHECK(hr_files_start_read(&fs, name, 5934, 100));  /* 6 blocks */
+    hr_files_kick(&fs, 100);
+    CHECK_INT(p.h.sends, 2);
+    CHECK_INT(p.asked[0], 0);
+    CHECK_INT(p.asked[1], 1);
+    CHECK_INT(fs.inflight, 2);
+    CHECK(fs.awaiting);
+    block_reply(&fs, name, 0, d, 1024, 5934, 0, 270);
+    CHECK_INT(p.h.sends, 3);               /* block 2 asked as 0 arrived */
+    CHECK_INT(p.asked[2], 2);
+    CHECK_INT(fs.inflight, 2);
+    CHECK_INT(fs.block, 1);
+    CHECK_INT(fs.next_req, 3);
+    block_reply(&fs, name, 1, d, 1024, 5934, 0, 440);
+    block_reply(&fs, name, 2, d, 1024, 5934, 0, 610);
+    block_reply(&fs, name, 3, d, 1024, 5934, 0, 780);
+    CHECK_INT(p.h.sends, 6);               /* 0..5 asked, nothing past the end */
+    CHECK_INT(p.asked[5], 5);
+    block_reply(&fs, name, 4, d, 1024, 5934, 0, 950);
+    CHECK_INT(p.h.sends, 6);
+    CHECK_INT(fs.inflight, 1);
+    block_reply(&fs, name, 5, d, 814, 5934, 0, 1120);
+    CHECK_INT(p.h.sends, 6);
+    CHECK_INT(p.h.done_calls, 1);
+    CHECK(p.h.done_state == HR_FILES_DONE);
+    CHECK_INT(p.h.sink_bytes, 5934);
+    CHECK_INT(fs.blocks_ok, 6);
+    CHECK_INT(fs.blocks_bad, 0);
+    CHECK_INT(fs.t_dryer_ms, 1020);        /* 170 x 6 */
+    CHECK_INT(fs.t_paused_ms, 0);
+
+    TEST_CASE("depth 2: size unknown -> one request until the first block");
+    psetup(&fs, &p);
+    hr_files_set_pacing(&fs, 2, 0);
+    CHECK(hr_files_start_read(&fs, "HRTempFC.txt", -1, 100));
+    hr_files_kick(&fs, 100);
+    CHECK_INT(p.h.sends, 1);
+    hr_files_tick(&fs, 200, true);
+    CHECK_INT(p.h.sends, 1);
+    block_reply(&fs, "HRTempFC.txt", 0, "0,Celsius, ", 11, 11, 0, 300);
+    CHECK(p.h.done_state == HR_FILES_DONE);
+    CHECK_INT(p.h.sends, 1);
+    /* a 3000-byte file: first block reveals 3 blocks; 1 and 2 go out together */
+    psetup(&fs, &p);
+    hr_files_set_pacing(&fs, 3, 0);
+    CHECK(hr_files_start_read(&fs, name, -1, 100));
+    hr_files_kick(&fs, 100);
+    CHECK_INT(p.h.sends, 1);
+    block_reply(&fs, name, 0, d, 1024, 3000, 0, 270);
+    CHECK_INT(p.h.sends, 3);
+    CHECK_INT(p.asked[1], 1);
+    CHECK_INT(p.asked[2], 2);
+    CHECK_INT(fs.inflight, 2);
+
+    TEST_CASE("depth 2: the dryer skips a request -> window rewound, re-asked");
+    psetup(&fs, &p);
+    hr_files_set_pacing(&fs, 2, 0);
+    CHECK(hr_files_start_read(&fs, name, 5934, 100));
+    hr_files_kick(&fs, 100);                            /* asks 0, 1 */
+    block_reply(&fs, name, 0, d, 1024, 5934, 0, 270);   /* asks 2 */
+    CHECK_INT(p.h.sends, 3);
+    block_reply(&fs, name, 2, d, 1024, 5934, 0, 440);   /* 1 was lost */
+    CHECK_INT(fs.blocks_bad, 1);
+    CHECK_INT(fs.block, 1);
+    CHECK_INT(p.h.sends, 5);                            /* re-asked 1 and 2 */
+    CHECK_INT(p.asked[3], 1);
+    CHECK_INT(p.asked[4], 2);
+    CHECK_INT(fs.inflight, 2);
+    block_reply(&fs, name, 1, d, 1024, 5934, 0, 610);
+    block_reply(&fs, name, 2, d, 1024, 5934, 0, 780);
+    CHECK_INT(fs.block, 3);
+    CHECK_INT(p.h.sink_calls, 3);
+    /* a duplicate of an accepted block also rewinds, and is never stored */
+    block_reply(&fs, name, 1, d, 1024, 5934, 0, 800);
+    CHECK_INT(p.h.sink_calls, 3);
+    CHECK_INT(fs.blocks_bad, 2);
+    CHECK_INT(fs.block, 3);
+    CHECK_INT(fs.next_req, 5);                          /* 3 and 4 re-asked */
+
+    TEST_CASE("depth 2: mismatches for ever end in ERR_MISMATCH");
+    psetup(&fs, &p);
+    hr_files_set_pacing(&fs, 2, 0);
+    CHECK(hr_files_start_read(&fs, name, 5934, 100));
+    hr_files_kick(&fs, 100);
+    for (int i = 0; i < HR_FILES_RETRIES * 3 + 1; i++) {
+        block_reply(&fs, "other.csv", 0, d, 1024, 5934, 0, 200 + i * 10);
+    }
+    CHECK(p.h.done_state == HR_FILES_ERROR);
+    CHECK(p.h.done_err == HR_FILES_ERR_MISMATCH);
+
+    TEST_CASE("depth 2: WAIT stops new requests, in-flight replies still land");
+    psetup(&fs, &p);
+    hr_files_set_pacing(&fs, 2, 0);
+    p.h.sink_verdict = HR_FILES_SINK_WAIT;
+    CHECK(hr_files_start_read(&fs, name, 5934, 100));
+    hr_files_kick(&fs, 100);                            /* 0, 1 out */
+    block_reply(&fs, name, 0, d, 1024, 5934, 0, 270);   /* WAIT: no request */
+    CHECK_INT(p.h.sends, 2);
+    CHECK(fs.paused);
+    CHECK_INT(fs.inflight, 1);
+    block_reply(&fs, name, 1, d, 1024, 5934, 0, 440);   /* still accepted */
+    CHECK_INT(p.h.sink_calls, 2);
+    CHECK_INT(fs.block, 2);
+    CHECK_INT(fs.inflight, 0);
+    CHECK_INT(p.h.sends, 2);
+    hr_files_tick(&fs, 500, true);
+    CHECK_INT(p.h.sends, 2);
+    p.h.sink_verdict = HR_FILES_SINK_OK;
+    hr_files_resume(&fs, 700);
+    CHECK_INT(p.h.sends, 4);                            /* 2, 3 */
+    CHECK_INT(p.asked[2], 2);
+    CHECK_INT(p.asked[3], 3);
+    CHECK_INT(fs.t_paused_ms, 430);                     /* 270 -> 700 */
+
+    TEST_CASE("depth 2: timeout rewinds the whole window");
+    psetup(&fs, &p);
+    hr_files_set_pacing(&fs, 2, 0);
+    CHECK(hr_files_start_read(&fs, name, 5934, 100));
+    hr_files_kick(&fs, 100);
+    hr_files_tick(&fs, 100 + HR_FILES_TIMEOUT_MS, true);
+    CHECK_INT(fs.timeouts, 1);
+    CHECK_INT(p.h.sends, 4);                            /* 0, 1 again */
+    CHECK_INT(p.asked[2], 0);
+    CHECK_INT(p.asked[3], 1);
+
+    TEST_CASE("gap: requests spaced by gap_ms, the held one goes from tick");
+    psetup(&fs, &p);
+    hr_files_set_pacing(&fs, 1, 500);
+    CHECK(hr_files_start_read(&fs, name, 5934, 100));
+    hr_files_kick(&fs, 100);
+    CHECK_INT(p.h.sends, 1);
+    block_reply(&fs, name, 0, d, 1024, 5934, 0, 270);   /* too soon: held */
+    CHECK_INT(p.h.sends, 1);
+    CHECK(fs.pending);
+    hr_files_tick(&fs, 400, true);
+    CHECK_INT(p.h.sends, 1);
+    hr_files_tick(&fs, 650, true);
+    CHECK_INT(p.h.sends, 2);
+    CHECK_INT(p.asked[1], 1);
+
+    TEST_CASE("pacing clamps");
+    hr_files_set_pacing(&fs, 0, 0);
+    CHECK_INT(fs.depth, 1);
+    hr_files_set_pacing(&fs, 99, 0);
+    CHECK_INT(fs.depth, HR_FILES_DEPTH_MAX);
+
+    TEST_CASE("depth 1 behaves exactly as before: one request per reply");
+    psetup(&fs, &p);
+    CHECK(hr_files_start_read(&fs, name, 5934, 100));
+    hr_files_kick(&fs, 100);
+    for (int i = 0; i < 5; i++) {
+        CHECK_INT(p.h.sends, i + 1);
+        CHECK_INT(fs.inflight, 1);
+        block_reply(&fs, name, i, d, 1024, 5934, 0, 270 + i * 170);
+    }
+    block_reply(&fs, name, 5, d, 814, 5934, 0, 270 + 5 * 170);
+    CHECK_INT(p.h.sends, 6);
+    CHECK(p.h.done_state == HR_FILES_DONE);
+}
+
+static void test_tempfc(void)
+{
+    TEST_CASE("HRTempFC.txt parser: the live record");
+    CHECK_INT(hr_tempfc_parse("0,Celsius, ", 11), HR_TEMP_C);
+    CHECK_INT(hr_tempfc_parse("1,Fahrenheit, ", 14), HR_TEMP_F);
+    TEST_CASE("HRTempFC.txt parser: the word wins, spelling/case/ends tolerated");
+    CHECK_INT(hr_tempfc_parse("1,Celsius,", 10), HR_TEMP_C);
+    CHECK_INT(hr_tempfc_parse("0,FAHRENHEIT", 12), HR_TEMP_F);
+    CHECK_INT(hr_tempfc_parse("Celsius\r\n", 9), HR_TEMP_C);
+    CHECK_INT(hr_tempfc_parse("  0,Celsius, \a\r\n", 17), HR_TEMP_C);
+    TEST_CASE("HRTempFC.txt parser: flag alone, 0 = Celsius as seen live");
+    CHECK_INT(hr_tempfc_parse("0,", 2), HR_TEMP_C);
+    CHECK_INT(hr_tempfc_parse("1,", 2), HR_TEMP_F);
+    TEST_CASE("HRTempFC.txt parser: rejects");
+    CHECK_INT(hr_tempfc_parse("FDFILEBLOCK,HRShelves.tx", 24),
+              HR_TEMP_DRYER_UNKNOWN);
+    CHECK_INT(hr_tempfc_parse("", 0), HR_TEMP_DRYER_UNKNOWN);
+    CHECK_INT(hr_tempfc_parse(NULL, 5), HR_TEMP_DRYER_UNKNOWN);
+    CHECK_INT(hr_tempfc_parse("On,1,80,[-],0,1,0,1,1,0,", 24),
+              HR_TEMP_DRYER_UNKNOWN);
+    CHECK_INT(hr_tempfc_parse("2,", 2), HR_TEMP_DRYER_UNKNOWN);
+    CHECK_INT(hr_tempfc_parse("Celsius Fahrenheit", 18), HR_TEMP_DRYER_UNKNOWN);
+    char big[80];
+    memset(big, 'x', sizeof(big));
+    CHECK_INT(hr_tempfc_parse(big, sizeof(big)), HR_TEMP_DRYER_UNKNOWN);
+}
+
+/* ------------------------------------------------------------------ */
 /* Batch CSV                                                           */
 /* ------------------------------------------------------------------ */
 static void test_csv(void)
@@ -1198,6 +1437,8 @@ int main(void)
     test_sm_list();
     test_sm_read();
     test_sm_timeouts_and_link();
+    test_sm_pipeline();
+    test_tempfc();
     test_csv();
     test_real_fixtures();
     return TEST_REPORT();

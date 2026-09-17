@@ -167,6 +167,8 @@ typedef void (*hr_files_done_fn)(hr_files_state_t st, hr_files_err_t err,
 #define HR_FILES_RETRIES      3
 #define HR_FILES_LIST_MAX     64      /* entries we will ask for */
 #define HR_FILES_MAX_SIZE     (512L * 1024L)
+/* Most FILEREADs the machine will have unanswered at once (see `depth`). */
+#define HR_FILES_DEPTH_MAX    4
 
 typedef struct {
     hr_files_state_t state;
@@ -175,16 +177,21 @@ typedef struct {
     char pattern[16];
     char name[HR_FILES_NAME_MAX];
     long index;         /* next list index to ask for */
-    long block;         /* next block to ask for */
+    long block;         /* next block EXPECTED (accepted so far = block) */
+    long next_req;      /* next block to ASK for; > block while pipelining */
     long size;          /* file size (from the list, then from blocks) */
     long received;      /* data bytes accepted so far */
     unsigned entries;   /* list entries received */
     int retries;        /* of the request in flight */
+    int inflight;       /* FILEREADs out and unanswered, 0..depth */
+    bool eof;           /* the last block has been accepted */
+    bool first_sent;    /* the transfer's first request has gone out */
 
-    bool awaiting;      /* a request is out, waiting for its reply */
+    bool awaiting;      /* a request is out, waiting for its reply (inflight > 0) */
     bool paused;        /* sink said WAIT; resume() clears */
     bool pending;       /* a request is due; tick() sends it */
-    unsigned long sent_ms;
+    unsigned long sent_ms;      /* oldest unanswered request (or last event) */
+    unsigned long last_send_ms; /* most recent request, for `gap_ms` */
     unsigned long paused_ms;
     unsigned long started_ms;
     unsigned long finished_ms;
@@ -201,6 +208,29 @@ typedef struct {
      * session - the same task that already answers REQINFO with WIFIINFO.
      */
     bool send_inline;
+    /*
+     * PIPELINING. How many FILEREADs may be unanswered at once, 1 (the
+     * default: strictly request-reply) to HR_FILES_DEPTH_MAX. With 2 the
+     * request for block n+1 is on the wire while the dryer is still sending
+     * block n. Only blocks below ceil(size/1024) are ever asked for, so the
+     * depth is 1 until the size is known (from the listing or the first
+     * block). Replies are accepted in order only: a block other than the
+     * expected one (lost request, duplicate) resets the window and re-asks
+     * from the expected block. Listing is never pipelined.
+     */
+    int depth;
+    /* Minimum spacing between two requests, ms; 0 = as fast as replies come.
+     * A caller that wants to go easy on the dryer's link sets this; requests
+     * held back by it go out from tick(). */
+    unsigned long gap_ms;
+
+    /* Per-transfer timing, for the honest "where did the time go" line:
+     * t_first_ms - start_read() to the first request on the wire;
+     * t_dryer_ms - sum of request->reply waits (exact at depth 1);
+     * t_paused_ms - sum of time the sink held the machine (WAIT..resume). */
+    unsigned long t_first_ms;
+    unsigned long t_dryer_ms;
+    unsigned long t_paused_ms;
 
     hr_files_send_fn send;
     void *send_user;
@@ -263,6 +293,19 @@ void hr_files_resume(hr_files_t *fs, unsigned long now_ms);
  * that wants to keep the wire quiet simply stops ticking.
  */
 void hr_files_tick(hr_files_t *fs, unsigned long now_ms, bool link_up);
+
+/*
+ * Put the pending request(s) on the wire NOW, from the caller's own task -
+ * what tick() would do at its next call, minus timeouts and the link rule.
+ * For the first request of a transfer: a main loop that has just started a
+ * flash write can be seconds away from its next tick, and a 6 KB read
+ * measured 6.2 s of which 5.2 s were spent waiting for that first tick.
+ */
+void hr_files_kick(hr_files_t *fs, unsigned long now_ms);
+
+/* Set the pipelining depth (clamped to 1..HR_FILES_DEPTH_MAX) and the
+ * minimum request spacing. Safe at any time; takes effect at the next send. */
+void hr_files_set_pacing(hr_files_t *fs, int depth, unsigned long gap_ms);
 
 /* 0..100 for a read with a known size, -1 otherwise. */
 int hr_files_progress_pct(const hr_files_t *fs);
@@ -329,6 +372,25 @@ bool hr_csv_row_parse(char *line, const hr_csv_cols_t *cols, hr_csv_row_t *row);
 /* Minutes since 00:00 1/1/2000 for a row with a time, else -1. Good enough
  * to space rows on a chart; not a calendar library. */
 long hr_csv_row_minutes(const hr_csv_row_t *row);
+
+/* ------------------------------------------------------------------ */
+/* HRTempFC.txt - the panel's temperature unit                         */
+/* ------------------------------------------------------------------ */
+/*
+ * The dryer keeps the unit its own panel shows in a data-flash record named
+ * HRTempFC.txt (33-entry table in the image at 0x7334c; entry @0x0680, 64 B).
+ * FILEREAD returns it like any file. Read live on 6.0.644170 (docs/30 §5):
+ *
+ *     "0,Celsius, "        (11 bytes, panel set to degrees C)
+ *
+ * so the record is "<flag>,<Fahrenheit|Celsius>, ". The word is what this
+ * parser trusts - it is unambiguous - and the flag only breaks a tie when
+ * the word is missing (0 = Celsius as observed; 1 is then Fahrenheit). An
+ * empty data-flash record comes back as the dryer's stale transmit buffer
+ * ("FDFILEBLOCK,HR..."), which is rejected. Returns HR_TEMP_F, HR_TEMP_C
+ * (as ints, hr_temp.h) or HR_TEMP_DRYER_UNKNOWN (-1).
+ */
+int hr_tempfc_parse(const char *data, size_t n);
 
 #ifdef __cplusplus
 }
