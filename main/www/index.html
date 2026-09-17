@@ -775,8 +775,8 @@
         and bottom thermocouples, the <b>room</b> thermocouple no live frame
         carries, vacuum and heater state, minute by minute. This page reads
         those files over the same USB link (<span class="mono">FDFILES</span> /
-        <span class="mono">FILEREAD</span>, both read-only) and keeps copies on
-        the adapter.</div>
+        <span class="mono">FILEREAD</span>, both read-only) straight from the
+        dryer, at about 8 KB/s.</div>
       <div id="df-status" class="notice" style="margin-top:10px"></div>
       <div class="rcprow" style="margin-top:10px">
         <button type="button" id="df-refresh" class="primary">Refresh list from dryer</button>
@@ -808,7 +808,7 @@
       </div>
       <div class="hint" id="df-note"></div>
       <div class="rcprow" style="margin-top:12px">
-        <a id="df-download" class="ghost" style="text-align:center;text-decoration:none;padding:10px" download>Download CSV</a>
+        <button type="button" id="df-download" class="ghost">Download CSV</button>
       </div>
     </div>
   </section>
@@ -3146,15 +3146,16 @@ $("#trendpress").addEventListener("click",()=>{
    ask the dryer and go through ctrlPost for the PIN. The chart is the run
    chart's twin: same helpers, same look, three series - shelf and room on
    the degree axis, vacuum on its own axis at the right. */
-let dfLast=null, dfShowPress=true, dfOpen=null, dfTimer=null, dfLastBusy=false, dfData=null;
+let dfLast=null, dfShowPress=true, dfOpen=null, dfTimer=null, dfData=null;
 
 function dfFmtSize(n){ return n>=10240 ? Math.round(n/1024)+" KB" : n+" B"; }
-/* "00042.26-09-15_10.30.csv" -> "#42 · 2026-09-15 10:30", else the name */
+/* "42838.2026-09-15_04.02.csv" -> "Batch of 2026-09-15 04:02" (the first
+   number is the machine's serial, the same on every file), else the name */
 function dfNameInfo(name){
-  const m=/^(\d{5})\.(\d{2,4})-(\d{2})-(\d{2})_(\d{2})\.(\d{2})\.csv$/i.exec(name);
+  const m=/^(\d+)\.(\d{2,4})-(\d{2})-(\d{2})_(\d{2})\.(\d{2})\.csv$/i.exec(name);
   if(!m) return {title:name, sub:""};
   const y=m[2].length===2?"20"+m[2]:m[2];
-  return {title:"Batch #"+parseInt(m[1],10), sub:y+"-"+m[3]+"-"+m[4]+" "+m[5]+":"+m[6]};
+  return {title:"Batch of "+y+"-"+m[3]+"-"+m[4]+" "+m[5]+":"+m[6], sub:""};
 }
 
 function dfRenderStatus(d){
@@ -3170,11 +3171,13 @@ function dfRenderStatus(d){
     msg=(d.state==="listing" ? "Listing files… "+(d.requests||0)+" asked"
         : "Reading "+esc(d.file)+" — block "+d.block+
           (d.size>0 ? ", "+dfFmtSize(d.received)+" of "+dfFmtSize(d.size)+" ("+d.pct+"%)" : ""));
+  }else if(dfBusyLocal){
+    return; /* the read in progress owns the status line */
   }else if(d.error){
     msg="Last transfer failed: "+esc(d.error)+(d.file?" ("+esc(d.file)+")":"")+".";
     kind="bad";
   }else if(d.state==="done"){
-    msg="Last transfer complete"+(d.file?": "+esc(d.file):"")+".";
+    msg="Last transfer complete"+(d.file?": "+esc(d.file)+", "+dfFmtSize(d.received)+" in "+(d.elapsed_ms/1000).toFixed(1)+" s":"")+".";
     kind="ok";
   }else{
     msg=d.link ? "Idle. Link to the dryer is up." : "Idle. No link to the dryer.";
@@ -3194,43 +3197,31 @@ function dfRenderList(d){
     return;
   }
   box.innerHTML="";
-  const cached=new Set(d.cached||[]);
   const files=(d.files||[]).slice().sort((a,b)=>b.name.localeCompare(a.name));
   files.forEach(f=>{
     const el=document.createElement("div");
     el.className="rcp";
     const info=dfNameInfo(f.name);
-    const isCached=cached.has(f.name)||f.cached;
     el.innerHTML="<h3></h3><div class='meta'></div><div class='rcprow'>"+
-      "<button type='button' class='df-open' "+(isCached?"":"disabled")+">Open</button>"+
-      "<button type='button' class='df-fetch ghost'></button></div>";
+      "<button type='button' class='df-open'>Open</button>"+
+      "<button type='button' class='df-dl ghost'>Download CSV</button></div>";
     el.querySelector("h3").textContent=info.title;
+    /* ~8 KB/s measured: say how long the read will take before it starts */
+    const secs=Math.max(1,Math.round(f.size/8192));
     el.querySelector(".meta").textContent=
-      [info.sub, f.name, dfFmtSize(f.size), isCached?"on adapter":"on dryer only"]
+      [info.sub, f.name, dfFmtSize(f.size), "~"+(secs>=60?Math.round(secs/60)+" min":secs+" s")+" to read"]
         .filter(Boolean).join("  \u00b7  ");
-    const fb=el.querySelector(".df-fetch");
-    fb.textContent=isCached?"Fetch again":"Fetch";
-    fb.disabled=d.busy||!d.enabled||f.size>d.max_size;
-    fb.addEventListener("click",()=>dfFetch(f.name));
-    el.querySelector(".df-open").addEventListener("click",()=>dfOpenFile(f.name));
-    box.appendChild(el);
-  });
-  /* cached copies of files the dryer no longer lists (or before any list) */
-  (d.cached||[]).filter(n=>!files.some(f=>f.name===n)).forEach(n=>{
-    const el=document.createElement("div");
-    el.className="rcp";
-    const info=dfNameInfo(n);
-    el.innerHTML="<h3></h3><div class='meta'></div><div class='rcprow'>"+
-      "<button type='button' class='df-open'>Open</button></div>";
-    el.querySelector("h3").textContent=info.title;
-    el.querySelector(".meta").textContent=[info.sub,n,"copy on adapter"].filter(Boolean).join("  \u00b7  ");
-    el.querySelector(".df-open").addEventListener("click",()=>dfOpenFile(n));
+    const ob=el.querySelector(".df-open"), db=el.querySelector(".df-dl");
+    ob.disabled=db.disabled=d.busy||!d.enabled||f.size>d.max_size;
+    ob.addEventListener("click",()=>dfOpenFile(f.name,f.size));
+    db.addEventListener("click",()=>dfDownload(f.name,f.size));
     box.appendChild(el);
   });
   $("#df-listnote").textContent = d.list_valid
-    ? files.length+" file"+(files.length===1?"":"s")+" matching .csv"+
+    ? files.length+" file"+(files.length===1?"":"s")+" matching .csv on the dryer"+
       (d.list_age_ms>=0 ? ", listed "+fmtDur(Math.round(d.list_age_ms/1000))+" ago" : "")+
-      ". Files over "+dfFmtSize(d.max_size)+" are not fetched."
+      ". Files are read from the dryer each time; nothing is stored on the adapter. Files over "+
+      dfFmtSize(d.max_size)+" are refused."
     : "";
 }
 
@@ -3240,15 +3231,10 @@ async function dfRefresh(){
     dfLast=d;
     dfRenderStatus(d);
     dfRenderList(d);
-    /* poll while a transfer runs, only while the page is showing */
     clearTimeout(dfTimer);
     if(d.busy && $("#v-s-files").classList.contains("active")){
       dfTimer=setTimeout(dfRefresh, 1000);
-    }else if(!d.busy && dfLastBusy && d.state==="done" && d.file){
-      /* a fetch we watched just finished: open it */
-      dfOpenFile(d.file);
     }
-    dfLastBusy=!!d.busy;
   }catch(e){ note($("#df-status"),"Could not reach the adapter.","bad"); }
 }
 
@@ -3269,27 +3255,74 @@ $("#df-enable").addEventListener("click",()=>{
     return;
   dfPost("/api/dryer/files/enable","on="+(cur?"0":"1"));
 });
-function dfFetch(name){
-  dfOpen=null;
-  dfPost("/api/dryer/files/fetch","name="+encodeURIComponent(name)+
-         ($("#df-force").checked?"&force=1":""));
+
+/* One GET reads the whole file from the dryer and streams it back; the
+   adapter's web server is busy for the duration (~8 KB/s), so the page says
+   so and does not poll meanwhile. The PIN travels in a header, which is why
+   this is a fetch() and not a plain link. */
+let dfBusyLocal=false;
+async function dfRead(name, size, json){
+  if(dfBusyLocal) return null;
+  if(!await ensurePin()) return null;
+  dfBusyLocal=true;
+  const secs=Math.max(1,Math.round((size||0)/8192));
+  note($("#df-status"),"Reading "+esc(name)+" from the dryer — about "+
+    (secs>=60?Math.round(secs/60)+" min":secs+" s")+". The panel pauses while the adapter is busy.","info");
+  $$("#df-list button").forEach(b=>b.disabled=true);
+  const url="/api/dryer/files/get?name="+encodeURIComponent(name)+
+            (json?"&format=json":"")+($("#df-force").checked?"&force=1":"");
+  const hdrs=pinGet()?{"X-HR-Pin":pinGet()}:{};
+  const t0=performance.now();
+  try{
+    const r=await fetch(url,{headers:hdrs});
+    if(!r.ok){
+      const j=await r.json().catch(()=>({}));
+      if(j.pin){ pinPut(""); pinVerified=false; }
+      note($("#df-status"),"Refused: "+esc(j.reason||("HTTP "+r.status)),"bad");
+      return null;
+    }
+    const body=json? await r.json() : await r.text();
+    const dt=((performance.now()-t0)/1000).toFixed(1);
+    const bytes=json?(body.bytes||0):body.length;
+    const err=json?body.error:(/# TRANSFER FAILED/.test(body)?"incomplete":"");
+    note($("#df-status"),(err?"Transfer failed ("+esc(err)+") after ":"Read ")+dfFmtSize(bytes)+
+      " in "+dt+" s"+(bytes&&dt>0?" ("+(bytes/1024/dt).toFixed(1)+" KB/s)":"")+".",err?"bad":"ok");
+    return body;
+  }catch(e){
+    note($("#df-status"),"The read did not complete: "+esc(e.message||e),"bad");
+    return null;
+  }finally{
+    dfBusyLocal=false;
+    setTimeout(dfRefresh,500);
+  }
 }
 
-async function dfOpenFile(name){
-  dfOpen=name;
+async function dfOpenFile(name, size){
   const card=$("#df-chartcard");
   card.style.display="";
   const info=dfNameInfo(name);
   $("#df-title").textContent=info.title+(info.sub?" \u00b7 "+info.sub:"");
-  $("#df-download").href="/api/dryer/files/get?name="+encodeURIComponent(name);
-  $("#df-download").setAttribute("download", name);
-  $("#df-note").textContent="Loading…";
-  try{
-    const d=await (await fetch("/api/dryer/files/get?name="+encodeURIComponent(name)+"&format=json")).json();
-    dfDraw(d);
-    card.scrollIntoView({behavior:"smooth",block:"start"});
-  }catch(e){ $("#df-note").textContent="Could not load the file."; }
+  $("#df-note").textContent="Reading from the dryer…";
+  const d=await dfRead(name,size,true);
+  if(!d){ $("#df-note").textContent="Could not read the file."; return; }
+  dfOpen=name; dfOpenSize=size;
+  dfDraw(d);
+  card.scrollIntoView({behavior:"smooth",block:"start"});
 }
+let dfOpenSize=0;
+async function dfDownload(name, size){
+  const text=await dfRead(name,size,false);
+  if(text===null) return;
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([text],{type:"text/csv"}));
+  a.download=name;
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); },1000);
+}
+$("#df-download").addEventListener("click",e=>{
+  e.preventDefault();
+  if(dfOpen) dfDownload(dfOpen, dfOpenSize);
+});
 function dfDraw(d){
   dfData=d;
   const svg=$("#df-chart"), W=600, H=240;

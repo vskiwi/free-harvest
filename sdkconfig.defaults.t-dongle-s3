@@ -87,6 +87,10 @@ CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES=n
 CONFIG_MQTT_TRANSPORT_WEBSOCKET=n
 # In-app log ring: 24 KB packed still holds ~370 lines (was 55 KB for 384).
 CONFIG_HR_LOG_RING_KB=24
+# Batch history (the dryer's own CSV logs over FDFILES / FILEREAD): on from
+# the first boot on this board - confirmed live 2026-09-17 (docs/30). Reads
+# still refuse to run during a batch unless asked with force=1.
+CONFIG_HR_BATCH_HISTORY_DEFAULT_ON=y
 
 # --- Console: UART0 only, no USB-Serial/JTAG secondary (see above).
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y

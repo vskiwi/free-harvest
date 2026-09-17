@@ -6,33 +6,20 @@
 #include "hr_capture.h"
 
 #include "esp_log.h"
-#include "esp_spiffs.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 
-#include <dirent.h>
-#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 static const char *TAG = "hr_files";
 
 #define NVS_NS   "hrfiles"
 #define NVS_KEY  "on"
-
-/* Cached copies live beside the capture log. SPIFFS is flat and caps names
- * at 31 characters after the mount point, so the prefix is two bytes and
- * the dryer's 24-character CSV names fit with room to spare. */
-#define MOUNT      "/capture"
-#define CACHE_PFX  "d."
-#define PART_PATH  MOUNT "/d.part"
-#define PATH_MAX_  (sizeof(MOUNT) + 1 + 31 + 1)
-/* Free space we insist on keeping for the capture log itself. */
-#define KEEP_FREE  (64 * 1024)
 
 static hr_session_t *s_session;
 static SemaphoreHandle_t s_lock;
@@ -43,16 +30,20 @@ static bool s_enabled;
 static char s_big[HR_FILES_BIGBUF];
 
 /*
- * One block, handed from the USB RX task (the sink) to the main loop (the
- * writer). The state machine answers WAIT for it and asks for the next
- * block only after hr_files_resume(), so one slot is always enough.
+ * Blocks accumulate here (USB RX task, the sink) until the HTTP handler
+ * takes them (hr_dryerfiles_take_chunk). The machine pauses when the buffer
+ * has no room for another block and resumes when it is emptied, so the
+ * dryer is asked for exactly as much as the browser is taking. Allocated
+ * for the transfer, freed when the last chunk has been taken.
  */
+#define CHUNK_CAP (HR_DF_CHUNK_BLOCKS * HR_FDBLOCK_SIZE)
 static struct {
-    bool full;
-    long block;
-    long nbytes;
-    char data[HR_FDBLOCK_SIZE];
-} s_mail;
+    char *buf;
+    size_t len;
+    bool full;              /* the sink answered WAIT; take_chunk resumes */
+    bool ended;             /* machine finished (done or error) */
+    hr_files_err_t err;
+} s_chunk;
 
 /* Last list from the dryer. */
 static hr_df_entry_t s_list[HR_DF_LIST_MAX];
@@ -60,11 +51,6 @@ static unsigned s_nlist;
 static bool s_list_valid;
 static unsigned long s_list_done_ms;
 
-/* The read in progress: where its bytes go, and whether they got there. */
-static char s_target[HR_FILES_NAME_MAX];
-static bool s_writing;          /* d.part is open for this transfer */
-static bool s_write_failed;
-static bool s_finish_pending;   /* DONE arrived; main loop must rename */
 static bool s_link_up;
 static bool s_running;
 
@@ -76,13 +62,10 @@ static unsigned long now_ms(void)
     return (unsigned long)(esp_timer_get_time() / 1000);
 }
 
-/* ------------------------------------------------------------------ */
-/* Names and paths                                                     */
-/* ------------------------------------------------------------------ */
 /*
- * A name we are willing to send and to store. The wire form is one
- * space-delimited argument, the reply header is comma-delimited, SPIFFS
- * wants it short, and a path separator has no business in a file name.
+ * A name we are willing to send. The wire form is one space-delimited
+ * argument and the reply header is comma-delimited; anything that could
+ * be read as a second argument, a field separator or a path is refused.
  */
 static bool name_ok(const char *name)
 {
@@ -90,7 +73,7 @@ static bool name_ok(const char *name)
         return false;
     }
     size_t n = strlen(name);
-    if (n >= HR_FILES_NAME_MAX || n + sizeof(CACHE_PFX) - 1 > 31) {
+    if (n >= HR_FILES_NAME_MAX) {
         return false;
     }
     for (size_t i = 0; i < n; i++) {
@@ -101,49 +84,6 @@ static bool name_ok(const char *name)
         }
     }
     return true;
-}
-
-static void cache_path(const char *name, char *out, size_t cap)
-{
-    snprintf(out, cap, MOUNT "/" CACHE_PFX "%.29s", name);
-}
-
-static bool file_exists(const char *path)
-{
-    struct stat st;
-    return stat(path, &st) == 0;
-}
-
-/* Walk the cache: count entries, optionally copy names, optionally find a
- * victim that is not `keep`. All under fs_enter by the caller. */
-static unsigned cache_scan(char names[][HR_FILES_NAME_MAX], unsigned cap,
-                           const char *keep, char *victim, size_t victim_cap)
-{
-    unsigned n = 0;
-    DIR *d = opendir(MOUNT);
-    if (d == NULL) {
-        return 0;
-    }
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        if (strncmp(e->d_name, CACHE_PFX, sizeof(CACHE_PFX) - 1) != 0) {
-            continue;
-        }
-        const char *nm = e->d_name + sizeof(CACHE_PFX) - 1;
-        if (strcmp(nm, "part") == 0) {
-            continue;
-        }
-        if (names != NULL && n < cap) {
-            snprintf(names[n], HR_FILES_NAME_MAX, "%.47s", nm);
-        }
-        if (victim != NULL && victim[0] == '\0' &&
-            (keep == NULL || strcmp(nm, keep) != 0)) {
-            snprintf(victim, victim_cap, "%.47s", nm);
-        }
-        n++;
-    }
-    closedir(d);
-    return n;
 }
 
 /* ------------------------------------------------------------------ */
@@ -163,26 +103,30 @@ static bool cb_send(const char *verb, const char *a1, const char *a2, void *u)
     return hr_session_send(s_session, &b);
 }
 
-/* USB RX task, under s_lock (the caller took it). Copy, never write flash. */
+/* USB RX task, under s_lock (the caller took it). Copy, never flash. */
 static int cb_sink(const hr_fdblock_t *b, void *u)
 {
     (void)u;
-    if (s_mail.full) {
+    if (s_chunk.buf == NULL || s_chunk.full ||
+        s_chunk.len + (size_t)b->nbytes > CHUNK_CAP) {
         return HR_FILES_SINK_FAIL; /* cannot happen: the machine waits */
     }
-    s_mail.block = b->block;
-    s_mail.nbytes = b->nbytes;
-    memcpy(s_mail.data, b->data, (size_t)b->nbytes);
-    hr_fdblock_unbel(s_mail.data, (size_t)b->nbytes);
-    s_mail.full = true;
+    memcpy(s_chunk.buf + s_chunk.len, b->data, (size_t)b->nbytes);
+    hr_fdblock_unbel(s_chunk.buf + s_chunk.len, (size_t)b->nbytes);
+    s_chunk.len += (size_t)b->nbytes;
 
     /* A one-line note per block in the capture, since the data itself never
      * goes through the frame path. */
     char note[96];
     snprintf(note, sizeof(note), "FDFILEBLOCK,%s,%ld,%ld,%ld,sum=%02X ok",
-             b->name, b->block, b->nbytes, b->size, b->sum);
+             b->name, b->nbytes, b->block, b->size, b->sum);
     hr_capture_append_dir((uint32_t)now_ms(), HR_CAP_DIR_RX, note);
-    return HR_FILES_SINK_WAIT;
+
+    if (s_chunk.len + HR_FDBLOCK_SIZE > CHUNK_CAP) {
+        s_chunk.full = true;        /* no room for another: hand it out */
+        return HR_FILES_SINK_WAIT;
+    }
+    return HR_FILES_SINK_OK;
 }
 
 static void cb_list(const hr_fdlist_entry_t *e, void *u)
@@ -197,7 +141,6 @@ static void cb_list(const hr_fdlist_entry_t *e, void *u)
         snprintf(s_list[s_nlist].name, sizeof(s_list[s_nlist].name), "%s",
                  e->name);
         s_list[s_nlist].size = e->size;
-        s_list[s_nlist].cached = false; /* filled in by the snapshot */
         s_nlist++;
     }
 }
@@ -205,16 +148,18 @@ static void cb_list(const hr_fdlist_entry_t *e, void *u)
 static void cb_done(hr_files_state_t st, hr_files_err_t err, void *u)
 {
     (void)u;
-    if (s_target[0] != '\0') {
-        /* a read ended; the main loop closes the file out */
-        s_finish_pending = true;
+    if (s_chunk.buf != NULL) {
+        s_chunk.ended = true;
+        s_chunk.err = (st == HR_FILES_DONE) ? HR_FILES_ERR_NONE : err;
     }
-    ESP_LOGI(TAG, "transfer %s%s%s (%lu requests, %lu blocks, %lu bad, "
-                  "%lu timeouts)",
+    ESP_LOGI(TAG, "transfer %s%s%s: %ld bytes in %lu ms (%lu requests, "
+                  "%lu blocks, %lu bad, %lu timeouts)",
              hr_files_state_str(st), err ? ": " : "", hr_files_err_str(err),
-             s_fs.requests, s_fs.blocks_ok, s_fs.blocks_bad, s_fs.timeouts);
-    hr_capture_event("files %s %s %s", hr_files_state_str(st),
-                     hr_files_err_str(err), s_target);
+             s_fs.received, now_ms() - s_fs.started_ms, s_fs.requests,
+             s_fs.blocks_ok, s_fs.blocks_bad, s_fs.timeouts);
+    hr_capture_event("files %s %s %s %ld B %lu ms", hr_files_state_str(st),
+                     hr_files_err_str(err), s_fs.name, s_fs.received,
+                     now_ms() - s_fs.started_ms);
 }
 
 /* ------------------------------------------------------------------ */
@@ -236,6 +181,10 @@ void hr_dryerfiles_init(hr_session_t *s)
     s_session = s;
     s_lock = xSemaphoreCreateMutex();
     hr_files_init(&s_fs, cb_send, NULL);
+    /* Ask for the next block from the reply itself (USB RX task, like the
+     * WIFIINFO answer to REQINFO): measured 70-100 ms a block against the
+     * 250 ms of a main-loop tick. */
+    s_fs.send_inline = true;
     hr_files_set_sink(&s_fs, cb_sink, NULL);
     hr_files_set_list_cb(&s_fs, cb_list, NULL);
     hr_files_set_done_cb(&s_fs, cb_done, NULL);
@@ -302,86 +251,18 @@ void hr_dryerfiles_on_frame(const hr_frame_t *f)
     UNLOCK();
 }
 
-/* Main loop. Flash work happens here, outside the lock. */
 void hr_dryerfiles_tick(unsigned long t, bool link_up, bool dryer_running)
 {
     if (s_lock == NULL) {
         return;
     }
-    /* 1. a block waiting to be written */
-    bool have_block = false;
-    long nbytes = 0;
-    static char data[HR_FDBLOCK_SIZE];
+    (void)t; /* the loop's clock can be seconds old after a flash write;
+                the machine compares against sends stamped with now_ms() */
     LOCK();
     s_link_up = link_up;
     s_running = dryer_running;
-    if (s_mail.full) {
-        have_block = true;
-        nbytes = s_mail.nbytes;
-        memcpy(data, s_mail.data, (size_t)nbytes);
-    }
+    hr_files_tick(&s_fs, now_ms(), link_up);
     UNLOCK();
-
-    if (have_block) {
-        bool ok = false;
-        if (hr_capture_fs_enter()) {
-            FILE *f = fopen(PART_PATH, s_writing ? "ab" : "wb");
-            if (f != NULL) {
-                ok = fwrite(data, 1, (size_t)nbytes, f) == (size_t)nbytes;
-                fclose(f);
-            } else {
-                ESP_LOGE(TAG, "open %s failed: %s", PART_PATH, strerror(errno));
-            }
-            hr_capture_fs_leave();
-        }
-        s_writing = true;
-        LOCK();
-        s_mail.full = false;
-        if (ok) {
-            hr_files_resume(&s_fs, t);
-        } else {
-            s_write_failed = true;
-            hr_files_cancel(&s_fs, HR_FILES_ERR_SINK, t);
-        }
-        UNLOCK();
-    }
-
-    /* 2. drive the state machine (requests, timeouts, link rule) */
-    LOCK();
-    hr_files_tick(&s_fs, t, link_up);
-    bool finish = s_finish_pending;
-    bool complete = (s_fs.state == HR_FILES_DONE);
-    char target[HR_FILES_NAME_MAX];
-    snprintf(target, sizeof(target), "%s", s_target);
-    if (finish) {
-        s_finish_pending = false;
-        s_target[0] = '\0';
-    }
-    UNLOCK();
-
-    /* 3. close out a finished read: keep it under its name, or drop it */
-    if (finish) {
-        if (hr_capture_fs_enter()) {
-            if (complete && s_writing && !s_write_failed) {
-                char dst[PATH_MAX_];
-                cache_path(target, dst, sizeof(dst));
-                remove(dst);
-                if (rename(PART_PATH, dst) != 0) {
-                    ESP_LOGE(TAG, "rename to %s failed: %s", dst,
-                             strerror(errno));
-                    remove(PART_PATH);
-                } else {
-                    ESP_LOGI(TAG, "cached %s (%ld bytes)", target,
-                             s_fs.received);
-                }
-            } else {
-                remove(PART_PATH);
-            }
-            hr_capture_fs_leave();
-        }
-        s_writing = false;
-        s_write_failed = false;
-    }
 }
 
 static hr_df_result_t precheck(bool force)
@@ -389,7 +270,7 @@ static hr_df_result_t precheck(bool force)
     if (!s_enabled) {
         return HR_DF_DISABLED;
     }
-    if (hr_files_busy(&s_fs) || s_mail.full || s_finish_pending) {
+    if (hr_files_busy(&s_fs) || s_chunk.buf != NULL) {
         return HR_DF_BUSY;
     }
     if (!s_link_up) {
@@ -414,7 +295,6 @@ hr_df_result_t hr_dryerfiles_refresh(const char *pattern, bool force)
     if (r == HR_DF_OK) {
         s_nlist = 0;
         s_list_valid = false;
-        s_target[0] = '\0';
         if (!hr_files_start_list(&s_fs, pattern, now_ms())) {
             r = HR_DF_BADNAME;
         }
@@ -436,7 +316,12 @@ hr_df_result_t hr_dryerfiles_fetch(const char *name, bool force)
     if (!name_ok(name)) {
         return HR_DF_BADNAME;
     }
-    /* size from the list, if we have it */
+    char *buf = malloc(CHUNK_CAP);
+    if (buf == NULL) {
+        ESP_LOGE(TAG, "no heap for the %u-block chunk buffer",
+                 HR_DF_CHUNK_BLOCKS);
+        return HR_DF_STORAGE;
+    }
     long expected = -1;
     LOCK();
     hr_df_result_t r = precheck(force);
@@ -445,71 +330,22 @@ hr_df_result_t hr_dryerfiles_fetch(const char *name, bool force)
             expected = s_list[i].size;
         }
     }
-    UNLOCK();
-    if (r != HR_DF_OK) {
-        return r;
-    }
-    if (expected > HR_FILES_MAX_SIZE) {
-        return HR_DF_TOOBIG;
-    }
-
-    /* Room on the partition, and a slot in the cache. Flash work: outside
-     * the lock, before the transfer is started. */
-    if (!hr_capture_ready() || !hr_capture_fs_enter()) {
-        return HR_DF_STORAGE;
-    }
-    size_t total = 0, used = 0;
-    if (esp_spiffs_info("capture", &total, &used) != ESP_OK) {
-        hr_capture_fs_leave();
-        return HR_DF_STORAGE;
-    }
-    size_t need = (expected > 0 ? (size_t)expected : HR_FILES_MAX_SIZE) +
-                  KEEP_FREE;
-    char victim[HR_FILES_NAME_MAX] = "";
-    unsigned have = cache_scan(NULL, 0, name, victim, sizeof(victim));
-    char own[PATH_MAX_];
-    cache_path(name, own, sizeof(own));
-    bool replacing = file_exists(own);
-    while ((have >= HR_DF_CACHE_MAX && !replacing) ||
-           (total > used && total - used < need)) {
-        if (victim[0] == '\0') {
-            break;
-        }
-        char vp[PATH_MAX_];
-        cache_path(victim, vp, sizeof(vp));
-        ESP_LOGW(TAG, "evicting cached %s", victim);
-        remove(vp);
-        have--;
-        victim[0] = '\0';
-        cache_scan(NULL, 0, name, victim, sizeof(victim));
-        if (esp_spiffs_info("capture", &total, &used) != ESP_OK) {
-            break;
-        }
-    }
-    remove(PART_PATH);
-    bool room = (total > used && total - used >= need);
-    hr_capture_fs_leave();
-    if (!room) {
-        ESP_LOGW(TAG, "not enough room on the capture partition for %s "
-                      "(%u free, %u needed)", name, (unsigned)(total - used),
-                 (unsigned)need);
-        return HR_DF_STORAGE;
-    }
-
-    LOCK();
-    r = precheck(force);
     if (r == HR_DF_OK) {
-        snprintf(s_target, sizeof(s_target), "%.47s", name);
-        s_writing = false;
-        s_write_failed = false;
-        s_mail.full = false;
+        s_chunk.buf = buf;
+        buf = NULL;
+        s_chunk.len = 0;
+        s_chunk.full = false;
+        s_chunk.ended = false;
+        s_chunk.err = HR_FILES_ERR_NONE;
         if (!hr_files_start_read(&s_fs, name, expected, now_ms())) {
             r = (s_fs.err == HR_FILES_ERR_TOO_BIG) ? HR_DF_TOOBIG
                                                     : HR_DF_BADNAME;
-            s_target[0] = '\0';
+            free(s_chunk.buf);
+            s_chunk.buf = NULL;
         }
     }
     UNLOCK();
+    free(buf);
     if (r == HR_DF_OK) {
         ESP_LOGW(TAG, "reading %s from the dryer (%ld bytes expected)%s", name,
                  expected, force ? " [forced]" : "");
@@ -519,6 +355,47 @@ hr_df_result_t hr_dryerfiles_fetch(const char *name, bool force)
     return r;
 }
 
+size_t hr_dryerfiles_take_chunk(char *out, size_t cap, bool *done,
+                                hr_files_err_t *err)
+{
+    size_t n = 0;
+    bool fin = false;
+    hr_files_err_t e = HR_FILES_ERR_NONE;
+    if (s_lock == NULL || out == NULL) {
+        if (done) *done = true;
+        if (err) *err = HR_FILES_ERR_CANCEL;
+        return 0;
+    }
+    LOCK();
+    if (s_chunk.buf == NULL) {
+        fin = true;
+        e = s_fs.err;
+    } else if (s_chunk.full || s_chunk.ended) {
+        /* a full buffer, or the tail after the machine finished */
+        n = s_chunk.len < cap ? s_chunk.len : cap;
+        memcpy(out, s_chunk.buf, n);
+        if (n < s_chunk.len) {
+            memmove(s_chunk.buf, s_chunk.buf + n, s_chunk.len - n);
+        }
+        s_chunk.len -= n;
+        if (s_chunk.len == 0) {
+            if (s_chunk.ended) {
+                fin = true;
+                e = s_chunk.err;
+                free(s_chunk.buf);
+                s_chunk.buf = NULL;
+            } else if (s_chunk.full) {
+                s_chunk.full = false;
+                hr_files_resume(&s_fs, now_ms());
+            }
+        }
+    }
+    UNLOCK();
+    if (done) *done = fin;
+    if (err) *err = e;
+    return n;
+}
+
 void hr_dryerfiles_cancel(void)
 {
     if (s_lock == NULL) {
@@ -526,6 +403,11 @@ void hr_dryerfiles_cancel(void)
     }
     LOCK();
     hr_files_cancel(&s_fs, HR_FILES_ERR_CANCEL, now_ms());
+    free(s_chunk.buf);
+    s_chunk.buf = NULL;
+    s_chunk.len = 0;
+    s_chunk.full = false;
+    s_chunk.ended = false;
     UNLOCK();
 }
 
@@ -538,17 +420,6 @@ void hr_dryerfiles_snapshot(hr_df_snapshot_t *out)
     if (s_lock == NULL) {
         return;
     }
-    /* the cache directory first - flash, outside the lock */
-    unsigned ncached = 0;
-    char cached[HR_DF_CACHE_MAX][HR_FILES_NAME_MAX];
-    if (hr_capture_ready() && hr_capture_fs_enter()) {
-        ncached = cache_scan(cached, HR_DF_CACHE_MAX, NULL, NULL, 0);
-        hr_capture_fs_leave();
-    }
-    if (ncached > HR_DF_CACHE_MAX) {
-        ncached = HR_DF_CACHE_MAX;
-    }
-
     unsigned long t = now_ms();
     LOCK();
     out->enabled = s_enabled;
@@ -561,9 +432,13 @@ void hr_dryerfiles_snapshot(hr_df_snapshot_t *out)
     out->received = s_fs.received;
     out->size = s_fs.size;
     out->pct = hr_files_progress_pct(&s_fs);
-    out->age_ms = hr_files_busy(&s_fs) ? 0 : t - s_fs.finished_ms;
+    bool busy = hr_files_busy(&s_fs);
+    out->age_ms = busy ? 0 : t - s_fs.finished_ms;
+    out->elapsed_ms = s_fs.transfers
+                          ? (busy ? t : s_fs.finished_ms) - s_fs.started_ms
+                          : 0;
     out->list_valid = s_list_valid;
-    out->list_age_ms = s_list_valid ? t - s_list_done_ms : (unsigned long)-1;
+    out->list_age_ms = s_list_valid ? t - s_list_done_ms : 0;
     out->nlist = s_nlist;
     memcpy(out->list, s_list, sizeof(hr_df_entry_t) * s_nlist);
     out->requests = s_fs.requests;
@@ -574,168 +449,32 @@ void hr_dryerfiles_snapshot(hr_df_snapshot_t *out)
     out->blocks_in = s_session ? s_session->blocks_in : 0;
     out->big_dropped = s_session ? s_session->stream.big_dropped : 0;
     UNLOCK();
-
-    out->ncached = ncached;
-    for (unsigned i = 0; i < ncached; i++) {
-        snprintf(out->cached[i], sizeof(out->cached[i]), "%.47s", cached[i]);
-        for (unsigned k = 0; k < out->nlist; k++) {
-            if (strcmp(out->list[k].name, cached[i]) == 0) {
-                out->list[k].cached = true;
-            }
-        }
-    }
 }
 
-bool hr_dryerfiles_cached_path(const char *name, char *path, size_t cap)
+int hr_dryerfiles_state_json(char *out, size_t cap)
 {
-    if (!name_ok(name) || path == NULL) {
-        return false;
+    if (out == NULL || cap == 0) {
+        return 0;
     }
-    cache_path(name, path, cap);
-    if (!hr_capture_ready() || !hr_capture_fs_enter()) {
-        return false;
+    if (s_lock == NULL) {
+        return snprintf(out, cap, "\"files_state\":\"off\",");
     }
-    bool ok = file_exists(path);
-    hr_capture_fs_leave();
-    return ok;
-}
-
-/* ------------------------------------------------------------------ */
-/* CSV -> JSON series                                                  */
-/* ------------------------------------------------------------------ */
-typedef struct {
-    hr_df_write_fn write;
-    void *user;
-    char buf[512];
-    size_t len;
-    bool ok;
-} jout_t;
-
-static void jflush(jout_t *o)
-{
-    if (o->ok && o->len > 0) {
-        o->ok = o->write(o->buf, o->len, o->user);
-    }
-    o->len = 0;
-}
-
-static void jput(jout_t *o, const char *s)
-{
-    size_t n = strlen(s);
-    if (o->len + n >= sizeof(o->buf)) {
-        jflush(o);
-    }
-    if (n >= sizeof(o->buf)) {
-        return; /* never: every piece here is short */
-    }
-    memcpy(o->buf + o->len, s, n);
-    o->len += n;
-}
-
-static void jint(jout_t *o, long v, bool first)
-{
-    char tmp[24];
-    snprintf(tmp, sizeof(tmp), "%s%ld", first ? "" : ",", v);
-    jput(o, tmp);
-}
-
-static void jnull_or_int(jout_t *o, long v, long none, bool first)
-{
-    if (v == none) {
-        jput(o, first ? "null" : ",null");
-    } else {
-        jint(o, v, first);
-    }
-}
-
-/*
- * One pass per series would mean rereading the file up to eight times; one
- * pass building eight arrays means holding them. With no PSRAM the middle
- * road is a row-oriented "rows":[[t,shelf,room,top,bot,mtorr,htr,"proc"],..]
- * - the browser transposes it in a line. `cols` says which is which.
- */
-bool hr_dryerfiles_stream_json(const char *name, hr_df_write_fn write,
-                               void *user)
-{
-    char path[PATH_MAX_];
-    if (!hr_dryerfiles_cached_path(name, path, sizeof(path)) || write == NULL) {
-        return false;
-    }
-    if (!hr_capture_fs_enter()) {
-        return false;
-    }
-    FILE *f = fopen(path, "r");
-    if (f == NULL) {
-        hr_capture_fs_leave();
-        return false;
-    }
-
-    jout_t o = {.write = write, .user = user, .len = 0, .ok = true};
-    static char line[HR_MAX_FRAME];
-    hr_csv_cols_t cols;
-    bool have_hdr = false;
-    long first_min = -1;
-    long rows = 0;
-    long prev_min = -1;
-
-    jput(&o, "{\"name\":\"");
-    jput(&o, name);
-    jput(&o, "\",\"cols\":[\"t_min\",\"shelf_f\",\"room_f\",\"top_f\",\"bot_f\","
-             "\"mtorr\",\"htr_on\",\"process\"],\"rows\":[");
-
-    while (o.ok && fgets(line, sizeof(line), f) != NULL) {
-        if (!have_hdr) {
-            if (hr_csv_header_parse(line, &cols)) {
-                have_hdr = true;
-            }
-            continue;
-        }
-        hr_csv_row_t r;
-        if (!hr_csv_row_parse(line, &cols, &r)) {
-            continue;
-        }
-        long min = hr_csv_row_minutes(&r);
-        if (min >= 0 && first_min < 0) {
-            first_min = min;
-        }
-        long t = (min >= 0 && first_min >= 0) ? min - first_min : prev_min + 1;
-        prev_min = t;
-
-        jput(&o, rows ? ",[" : "[");
-        jint(&o, t, true);
-        jnull_or_int(&o, r.mid_f, HR_CSV_NO_TEMP, false);
-        jnull_or_int(&o, r.room_f, HR_CSV_NO_TEMP, false);
-        jnull_or_int(&o, r.top_f, HR_CSV_NO_TEMP, false);
-        jnull_or_int(&o, r.bot_f, HR_CSV_NO_TEMP, false);
-        jnull_or_int(&o, r.mtorr, -1, false);
-        jnull_or_int(&o, r.htron, -1, false);
-        /* process text, escaped minimally: it is the dryer's own ASCII */
-        jput(&o, ",\"");
-        char esc[48];
-        size_t e = 0;
-        for (const char *p = r.process; *p && e + 2 < sizeof(esc); p++) {
-            unsigned char c = (unsigned char)*p;
-            if (c == '"' || c == '\\') {
-                esc[e++] = '\\';
-                esc[e++] = (char)c;
-            } else if (c >= 0x20 && c < 0x7f) {
-                esc[e++] = (char)c;
-            }
-        }
-        esc[e] = '\0';
-        jput(&o, esc);
-        jput(&o, "\"]");
-        rows++;
-    }
-    fclose(f);
-    hr_capture_fs_leave();
-
-    char tail[64];
-    snprintf(tail, sizeof(tail), "],\"n\":%ld,\"header\":%s}", rows,
-             have_hdr ? "true" : "false");
-    jput(&o, tail);
-    jflush(&o);
-    return o.ok && have_hdr;
+    LOCK();
+    hr_files_state_t st = s_fs.state;
+    hr_files_err_t err = s_fs.err;
+    unsigned long req = s_fs.requests, to = s_fs.timeouts,
+                  ok = s_fs.blocks_ok, bad = s_fs.blocks_bad,
+                  tr = s_fs.transfers;
+    bool en = s_enabled;
+    UNLOCK();
+    int n = snprintf(out, cap,
+                     "\"files_enabled\":%s,\"files_state\":\"%s\","
+                     "\"files_error\":\"%s\",\"files_requests\":%lu,"
+                     "\"files_timeouts\":%lu,\"files_blocks_ok\":%lu,"
+                     "\"files_blocks_bad\":%lu,\"files_transfers\":%lu,",
+                     en ? "true" : "false", hr_files_state_str(st),
+                     hr_files_err_str(err), req, to, ok, bad, tr);
+    return (n < 0 || (size_t)n >= cap) ? 0 : n;
 }
 
 const char *hr_df_result_str(hr_df_result_t r)
@@ -747,7 +486,7 @@ const char *hr_df_result_str(hr_df_result_t r)
     case HR_DF_LINK:     return "no link to the dryer";
     case HR_DF_RUNNING:  return "the dryer is running a batch (force=1 to override)";
     case HR_DF_BADNAME:  return "not a file name the dryer would have";
-    case HR_DF_STORAGE:  return "no room on the capture partition";
+    case HR_DF_STORAGE:  return "no memory for the transfer";
     case HR_DF_TOOBIG:   return "file too large to fetch";
     default:             return "?";
     }

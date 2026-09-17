@@ -10,6 +10,8 @@
 #define BLOCK_VERB "FDFILEBLOCK,"
 #define BLOCK_VERB_LEN 12
 
+static void maybe_send(hr_files_t *fs, unsigned long now_ms);
+
 /* ------------------------------------------------------------------ */
 /* FDFILELIST                                                          */
 /* ------------------------------------------------------------------ */
@@ -97,14 +99,17 @@ int hr_fdblock_header_len(const char *buf, size_t len, long *nbytes)
     if (i - BLOCK_VERB_LEN >= HR_FILES_NAME_MAX) {
         return -1;
     }
-    /* block, nbytes, size - each needs its terminating comma present */
+    /* nbytes, block, size - each needs its terminating comma present.
+     * THIS ORDER IS CONFIRMED LIVE (2026-09-17, 6.0.644170): the dryer
+     * writes "FDFILEBLOCK,%s,%d,%d,%ld," as (name, bytes read, block, size)
+     * - sendFileBlock at 0x20f30 passes r3 = bytes read, [sp] = block. */
     long block, n, size;
-    int c = int_field(buf, len, i + 1, &block);
+    int c = int_field(buf, len, i + 1, &n);
     if (c < 0) {
         /* either not there yet or not a number: look for the comma */
         return (memchr(buf + i + 1, ',', len - i - 1) == NULL) ? 0 : -1;
     }
-    c = int_field(buf, len, (size_t)c + 1, &n);
+    c = int_field(buf, len, (size_t)c + 1, &block);
     if (c < 0) {
         size_t from = (size_t)i + 1;
         const char *p = memchr(buf + from, ',', len - from);
@@ -165,8 +170,8 @@ bool hr_fdblock_parse(const char *frame, size_t len, hr_fdblock_t *out)
     out->name[nl] = '\0';
 
     long block = 0, size = 0;
-    int c = int_field(frame, len, (size_t)(q - frame) + 1, &block);
-    c = int_field(frame, len, (size_t)c + 1, &n);
+    int c = int_field(frame, len, (size_t)(q - frame) + 1, &n);
+    c = int_field(frame, len, (size_t)c + 1, &block);
     c = int_field(frame, len, (size_t)c + 1, &size);
     (void)c;
     out->block = block;
@@ -377,6 +382,9 @@ void hr_files_on_frame(hr_files_t *fs, const hr_frame_t *f, unsigned long now_ms
         return;
     }
     fs->pending = true;
+    if (fs->send_inline) {
+        maybe_send(fs, now_ms);
+    }
 }
 
 void hr_files_on_block(hr_files_t *fs, const char *frame, size_t len,
@@ -447,6 +455,9 @@ void hr_files_on_block(hr_files_t *fs, const char *frame, size_t len,
         return;
     }
     fs->pending = true;
+    if (fs->send_inline) {
+        maybe_send(fs, now_ms);
+    }
 }
 
 void hr_files_resume(hr_files_t *fs, unsigned long now_ms)
@@ -458,6 +469,10 @@ void hr_files_resume(hr_files_t *fs, unsigned long now_ms)
     if (fs->state == HR_FILES_READING && !fs->pending && !fs->awaiting) {
         /* the block the sink just stored was the last one */
         finish(fs, HR_FILES_DONE, HR_FILES_ERR_NONE, now_ms);
+        return;
+    }
+    if (fs->send_inline) {
+        maybe_send(fs, now_ms);
     }
 }
 
@@ -477,6 +492,22 @@ static bool send_request(hr_files_t *fs)
     return ok;
 }
 
+/* Put the pending request on the wire, if there is one and nothing holds it. */
+static void maybe_send(hr_files_t *fs, unsigned long now_ms)
+{
+    if (!hr_files_busy(fs) || fs->awaiting || fs->paused || !fs->pending) {
+        return;
+    }
+    fs->pending = false;
+    fs->requests++;
+    if (!send_request(fs)) {
+        finish(fs, HR_FILES_ERROR, HR_FILES_ERR_SEND, now_ms);
+        return;
+    }
+    fs->awaiting = true;
+    fs->sent_ms = now_ms;
+}
+
 void hr_files_tick(hr_files_t *fs, unsigned long now_ms, bool link_up)
 {
     if (fs == NULL || !hr_files_busy(fs)) {
@@ -487,7 +518,11 @@ void hr_files_tick(hr_files_t *fs, unsigned long now_ms, bool link_up)
         return;
     }
     if (fs->awaiting) {
-        if (now_ms - fs->sent_ms >= fs->timeout_ms) {
+        /* (long) so a tick clocked BEFORE an inline send - the caller's
+         * loop read its clock, did other work, then ticked - reads as no
+         * time passed instead of as an unsigned eternity: that exact
+         * pattern re-asked one block in every twenty on the real board. */
+        if ((long)(now_ms - fs->sent_ms) >= (long)fs->timeout_ms) {
             fs->timeouts++;
             fs->awaiting = false;
             if (++fs->retries > fs->max_retries) {
@@ -501,22 +536,12 @@ void hr_files_tick(hr_files_t *fs, unsigned long now_ms, bool link_up)
     if (fs->paused) {
         /* A sink that never resumes must not leave the machine READING for
          * ever: storage that slow is storage that failed. */
-        if (now_ms - fs->paused_ms >= fs->timeout_ms * 4) {
+        if ((long)(now_ms - fs->paused_ms) >= (long)(fs->timeout_ms * 4)) {
             finish(fs, HR_FILES_ERROR, HR_FILES_ERR_SINK, now_ms);
         }
         return;
     }
-    if (!fs->pending) {
-        return;
-    }
-    fs->pending = false;
-    fs->requests++;
-    if (!send_request(fs)) {
-        finish(fs, HR_FILES_ERROR, HR_FILES_ERR_SEND, now_ms);
-        return;
-    }
-    fs->awaiting = true;
-    fs->sent_ms = now_ms;
+    maybe_send(fs, now_ms);
 }
 
 int hr_files_progress_pct(const hr_files_t *fs)

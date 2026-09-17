@@ -3,22 +3,31 @@
  *
  * ESP-side glue around hr_files (components/hr_protocol): owns the transfer
  * state machine, the side buffer the stream collects FDFILEBLOCK frames in,
- * a one-block mailbox between the USB RX task and the main loop, the cached
- * copies on the capture partition, and the on/off switch in NVS.
+ * an 8 KB chunk buffer between the USB RX task and the HTTP handler that is
+ * streaming the file to the browser, the last file list, and the on/off
+ * switch in NVS.
+ *
+ * Files are STREAMED, not cached. The first version wrote them to the
+ * capture partition: a 1 KB fwrite() on the board's 11.9 MB SPIFFS measured
+ * 0.7-10 s, every flash write stalls the whole chip (code runs from flash),
+ * the capture writer dropped 160 lines and the trend save failed while a
+ * 90 KB file was being written, and the write itself then failed with EIO -
+ * the failure mode upstream added /api/storage/format for. The dryer keeps
+ * the files; the browser gets the bytes as the blocks arrive.
  *
  * Threads:
- *   USB RX task   hr_dryerfiles_on_frame() / the block sink - copy only,
- *                 never flash (hr_capture.h explains why).
- *   main loop     hr_dryerfiles_tick() - sends requests, writes blocks to
- *                 SPIFFS, finishes files.
- *   httpd         refresh / fetch / cancel / snapshot / stream - start,
- *                 stop and read; the dryer is never spoken to from here.
+ *   USB RX task   hr_dryerfiles_on_frame() / the block sink - copy into the
+ *                 chunk buffer, ask for the next block, never flash.
+ *   main loop     hr_dryerfiles_tick() - timeouts and the link rule.
+ *   httpd         refresh / fetch+chunks / cancel / snapshot - starts a
+ *                 transfer and consumes chunks; the dryer is only ever
+ *                 spoken to through hr_files' send callback.
  *
  * Safety: every request to the dryer is a read (FDFILES / FILEREAD, both
  * in the SAFE allow-list). They still go out only when the feature is
  * switched on, the link is up, and the dryer is NOT running a batch unless
- * the caller says `force` - a kilobyte a quarter-second on the USB link is
- * not something to try for the first time mid-run.
+ * the caller says `force` - ten requests a second on the USB link is not
+ * something to do to a running machine without meaning to.
  *
  * Compiled only with CONFIG_HR_BATCH_HISTORY.
  */
@@ -31,10 +40,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Files kept on the capture partition, newest fetched last. */
-#define HR_DF_CACHE_MAX 3
 /* List entries remembered from the last FDFILES sweep. */
 #define HR_DF_LIST_MAX  40
+/* Blocks per chunk handed to the HTTP handler (8 KB of heap, per transfer). */
+#define HR_DF_CHUNK_BLOCKS 8
 
 typedef enum {
     HR_DF_OK = 0,
@@ -43,14 +52,13 @@ typedef enum {
     HR_DF_LINK,       /* no dryer link */
     HR_DF_RUNNING,    /* dryer is running a batch and force was not given */
     HR_DF_BADNAME,    /* not a name we will put on the wire */
-    HR_DF_STORAGE,    /* capture partition unavailable or full */
+    HR_DF_STORAGE,    /* no heap for the chunk buffer */
     HR_DF_TOOBIG,     /* over HR_FILES_MAX_SIZE */
 } hr_df_result_t;
 
 typedef struct {
     char name[HR_FILES_NAME_MAX];
     long size;
-    bool cached;
 } hr_df_entry_t;
 
 /* A consistent copy of everything the UI shows, taken under the lock. */
@@ -66,12 +74,11 @@ typedef struct {
     long size;
     int pct;
     unsigned long age_ms;             /* since the transfer finished; 0 if running */
-    unsigned long list_age_ms;        /* since the list completed; -1 never */
+    unsigned long elapsed_ms;         /* last/current transfer's duration */
+    unsigned long list_age_ms;        /* since the list completed */
     bool list_valid;
     unsigned nlist;
     hr_df_entry_t list[HR_DF_LIST_MAX];
-    unsigned ncached;
-    char cached[HR_DF_CACHE_MAX][HR_FILES_NAME_MAX];
     /* lifetime counters, for the log and the live probe */
     unsigned long requests, timeouts, blocks_ok, blocks_bad, transfers,
                   blocks_in, big_dropped;
@@ -91,31 +98,32 @@ void hr_dryerfiles_tick(unsigned long now_ms, bool link_up, bool dryer_running);
 /* Ask the dryer for its file list (names containing `pattern`; NULL = ".csv"). */
 hr_df_result_t hr_dryerfiles_refresh(const char *pattern, bool force);
 
-/* Read `name` from the dryer into the cache. */
+/*
+ * Start reading `name` from the dryer. Blocks are handed out by
+ * hr_dryerfiles_take_chunk(); the caller MUST keep calling it until it
+ * reports done or error, or call hr_dryerfiles_cancel(). A caller that
+ * stops asking is noticed: the machine aborts (ERR_SINK) after a few
+ * seconds without a consumer.
+ */
 hr_df_result_t hr_dryerfiles_fetch(const char *name, bool force);
+
+/*
+ * Next chunk of the file being read, up to HR_DF_CHUNK_BLOCKS * 1024 bytes
+ * (CRs restored). Returns the number of bytes copied, 0 when nothing is
+ * ready yet. *done is set once the whole file has been handed out or the
+ * transfer failed (*err says which); after that the transfer's buffer is
+ * released and a new fetch may start.
+ */
+size_t hr_dryerfiles_take_chunk(char *out, size_t cap, bool *done,
+                                hr_files_err_t *err);
 
 void hr_dryerfiles_cancel(void);
 
 void hr_dryerfiles_snapshot(hr_df_snapshot_t *out);
 
-/*
- * Cached copy of `name`: the path on the capture partition if the name is
- * acceptable and the file is complete, else false. The caller brackets its
- * reads with hr_capture_fs_enter()/leave().
- */
-bool hr_dryerfiles_cached_path(const char *name, char *path, size_t cap);
-
-/*
- * Stream the cached CSV as JSON series for the chart:
- *   {"name":..,"n":N,"cols":{...},"t":[minutes from first row],
- *    "shelf":[F],"room":[F],"top":[F],"bot":[F],"mtorr":[..],"htr":[0/1],
- *    "process":[".."]}
- * `write` is called with successive chunks; returns false to stop. Returns
- * false if the file is missing or has no header.
- */
-typedef bool (*hr_df_write_fn)(const char *chunk, size_t n, void *user);
-bool hr_dryerfiles_stream_json(const char *name, hr_df_write_fn write,
-                               void *user);
+/* One line for /api/state: "files_state":"idle","files_requests":N,... .
+ * Cheap, takes the lock briefly. Returns bytes written. */
+int hr_dryerfiles_state_json(char *out, size_t cap);
 
 const char *hr_df_result_str(hr_df_result_t r);
 

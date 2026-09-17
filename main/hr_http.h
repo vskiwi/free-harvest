@@ -10,10 +10,12 @@
  *   GET  /api/verbs        JSON: per-verb latest body, count, changed mask
  *   GET  /api/capture      text/plain download of all retained frames
  *   GET  /api/enc          JSON: the last encoded frames (6.0.644170 transport)
- *   GET  /api/dryer/files          JSON: file-client status, last FDFILES list, cache
- *   GET  /api/dryer/files/get?name=X[&format=json]  cached copy of X (CSV / rows)
+ *   GET  /api/dryer/files          JSON: file-client status and the last FDFILES list
+ *   GET  /api/dryer/files/get?name=X[&force=1][&format=json]
+ *                                  read X from the dryer, streamed as it
+ *                                  arrives (CSV, or parsed rows) - PIN via
+ *                                  X-HR-Pin header or pin= in the query
  *   POST /api/dryer/files/refresh  [pattern=.csv][force=1]  ask the dryer (PIN)
- *   POST /api/dryer/files/fetch    name=X [force=1]         read X (PIN)
  *   POST /api/dryer/files/cancel   / /enable on=0|1          (PIN)
  *                          (CONFIG_HR_BATCH_HISTORY; hr_dryerfiles.h)
  *   GET  /api/scan         start a WiFi scan / return last results

@@ -3,12 +3,20 @@
  * stream's big-frame side buffer on both transports, the transfer state
  * machine, and the batch CSV parser.
  *
- * ALL FIXTURES HERE ARE SYNTHETIC. They are built from the format strings in
- * the 6.0.641041 image (G0641041.h6r.bin: "FDFILELIST,%s,%d,%ld\r" 0x66c20,
- * "FDFILEBLOCK,%s,%d,%d,%ld," 0x66c40, "%02X\r" 0x66c38, the CSV header at
- * 0x6f0c8) and the disassembly of the block sender (0x20f30: 1024-byte reads,
- * CR -> BEL, byte sum mod 256). No real capture of a block exists yet; when
- * one does, add it beside these and keep both.
+ * Two kinds of fixture:
+ *
+ *   REAL (2026-09-17, dryer on 6.0.644170, bench/2026-09-17-batch-history/):
+ *   the FDFILELIST replies as captured, the first and last FDFILEBLOCK of
+ *   42838.2026-01-13_04.37.csv rebuilt byte for byte from the file that
+ *   round-tripped (the frame's own trailer "F8" was seen on the wire before
+ *   the parser could read it, docs/30 §3), the header and rows of a real
+ *   50-hour batch log, and the contents of HRTempFC.txt.
+ *
+ *   SYNTHETIC: make_block() builds frames in the confirmed shape from any
+ *   payload, for the state-machine and side-buffer tests; enc_frame() is a
+ *   test-only ")S" encoder for the path a 6.0.644170 machine would take if
+ *   it ever encoded a block (it does not - blocks arrive in plaintext - but
+ *   the framer must survive it).
  */
 #include "hr_enc.h"
 #include "hr_files.h"
@@ -29,8 +37,9 @@
 static size_t make_block(char *out, size_t cap, const char *name, long block,
                          const char *data, size_t n, long size, int corrupt)
 {
-    int h = snprintf(out, cap, "FDFILEBLOCK,%s,%ld,%ld,%ld,", name, block,
-                     (long)n, size);
+    /* (name, bytes, block, size) - the order confirmed live 2026-09-17 */
+    int h = snprintf(out, cap, "FDFILEBLOCK,%s,%ld,%ld,%ld,", name, (long)n,
+                     block, size);
     unsigned sum = 0;
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)data[i];
@@ -181,7 +190,7 @@ static void test_fdlist_parse(void)
 static void test_fdblock_header_len(void)
 {
     TEST_CASE("block header, incremental");
-    const char *hdr = "FDFILEBLOCK,00042.26-09-15_10.30.csv,0,1024,61440,";
+    const char *hdr = "FDFILEBLOCK,00042.26-09-15_10.30.csv,1024,0,61440,";
     size_t full = strlen(hdr);
     long n = -1;
     /* every proper prefix is "need more", the whole thing is complete */
@@ -200,7 +209,7 @@ static void test_fdblock_header_len(void)
     /* letters where numbers belong */
     CHECK_INT(hr_fdblock_header_len("FDFILEBLOCK,a,x,1,2,", 20, &n), -1);
     /* a block bigger than the dryer ever sends */
-    CHECK_INT(hr_fdblock_header_len("FDFILEBLOCK,a,0,1025,9,", 23, &n), -1);
+    CHECK_INT(hr_fdblock_header_len("FDFILEBLOCK,a,1025,0,9,", 23, &n), -1);
     /* the author's empty reply */
     CHECK_INT(hr_fdblock_header_len("FDFILEBLOCK,,0,0,0,", 19, &n), 19);
     CHECK_INT(n, 0);
@@ -259,7 +268,7 @@ static void test_fdblock_parse(void)
     wl = make_block(wire, sizeof(wire), "x.csv", 0, "abc", 3, 3, 0);
     CHECK(!hr_fdblock_parse(wire, wl - 2, &b));  /* one byte short */
     CHECK(!hr_fdblock_parse(wire, wl, &b));      /* CR included */
-    CHECK(!hr_fdblock_parse("FDFILEBLOCK,x,0,3,3,abcZZ", 24, &b)); /* bad hex */
+    CHECK(!hr_fdblock_parse("FDFILEBLOCK,x,3,0,3,abcZZ", 24, &b)); /* bad hex */
 }
 
 /* ------------------------------------------------------------------ */
@@ -636,6 +645,41 @@ static void test_sm_read(void)
     CHECK(h.done_state == HR_FILES_DONE);
     CHECK_INT(h.sends, 2);
 
+    TEST_CASE("read: inline sending asks for the next block from the reply");
+    setup(&fs, &h);
+    fs.send_inline = true;
+    CHECK(hr_files_start_read(&fs, name, 2300, 100));
+    CHECK_INT(h.sends, 0);               /* the first one still waits for tick */
+    hr_files_tick(&fs, 101, true);
+    CHECK_INT(h.sends, 1);
+    block_reply(&fs, name, 0, d1, 1024, 2300, 0, 150);
+    CHECK_INT(h.sends, 2);               /* no tick in between */
+    CHECK_STR(h.a2, "1");
+    block_reply(&fs, name, 1, d2, 1024, 2300, 0, 250);
+    CHECK_INT(h.sends, 3);
+    block_reply(&fs, name, 2, "tail", 252, 2300, 0, 350);
+    CHECK_INT(h.sends, 3);
+    CHECK(h.done_state == HR_FILES_DONE);
+    /* with WAIT the inline send waits for resume() */
+    setup(&fs, &h);
+    fs.send_inline = true;
+    h.sink_verdict = HR_FILES_SINK_WAIT;
+    CHECK(hr_files_start_read(&fs, name, 3000, 100));
+    hr_files_tick(&fs, 101, true);
+    block_reply(&fs, name, 0, d1, 1024, 3000, 0, 150);
+    CHECK_INT(h.sends, 1);
+    hr_files_resume(&fs, 200);
+    CHECK_INT(h.sends, 2);
+    CHECK_STR(h.a2, "1");
+    /* listing too */
+    setup(&fs, &h);
+    fs.send_inline = true;
+    CHECK(hr_files_start_list(&fs, ".csv", 100));
+    hr_files_tick(&fs, 101, true);
+    list_reply(&fs, "a.csv", 0, 10, 150);
+    CHECK_INT(h.sends, 2);
+    CHECK_STR(h.a2, "1");
+
     TEST_CASE("read: sink WAIT pauses requests until resume");
     setup(&fs, &h);
     h.sink_verdict = HR_FILES_SINK_WAIT;
@@ -764,6 +808,18 @@ static void test_sm_timeouts_and_link(void)
     block_reply(&fs, name, 0, d1, 1024, 3000, 0, t + 5);
     CHECK_INT(h.sink_calls, 0);
     CHECK(fs.state == HR_FILES_ERROR);
+
+    TEST_CASE("timeout: a tick clocked before the send is not a timeout");
+    setup(&fs, &h);
+    fs.send_inline = true;
+    CHECK(hr_files_start_read(&fs, name, 3000, 5000));
+    hr_files_tick(&fs, 5001, true);
+    block_reply(&fs, name, 0, d1, 1024, 3000, 0, 5100);   /* inline send at 5100 */
+    CHECK_INT(h.sends, 2);
+    hr_files_tick(&fs, 4000, true);                        /* stale clock */
+    CHECK_INT(h.sends, 2);
+    CHECK_INT(fs.timeouts, 0);
+    CHECK(fs.awaiting);
 
     TEST_CASE("link down aborts at once and sends nothing more");
     setup(&fs, &h);
@@ -943,6 +999,195 @@ static void test_csv(void)
     }
 }
 
+
+/* ------------------------------------------------------------------ */
+/* REAL fixtures                                                       */
+/* ------------------------------------------------------------------ */
+/* Block 0 (1024 data bytes, CR -> BEL, sum F8) and block 2 (the 675-byte
+ * tail, sum 31) of 42838.2026-01-13_04.37.csv, 2723 bytes. */
+static const char REAL_BLOCK0[] =
+    "FDFILEBLOCK,42838.2026-01-13_04.37.csv,1024,0,2723,,TStamp,mTorr,HtrReq,HtrOn,Top-J20,Mid-"
+    "J17,Bot-J19,Room-J18,Process,Master,TTT,HPP,mT~Hr,mT~Mid,LowF,v6.5.0.644170,SN=42838,HL/D,"
+    "mT~50,HL/D/6,TmTyp=B,500,600,150,-System Name-,Oil-Free Pump,EndPump:Off,HLG4SA325B7A04906"
+    ",\a\n"
+    "11,1/13/2026 4:37,29203,0,0,68,67,67,68,Test-f-h-V,150,2500i 150o 500s,0:0:0,0,0,0,0,0, , "
+    ", , , ,500,600,150,,Pump On,\a\n"
+    "11,1/13/2026 4:38,7319,0,0,67,67,67,69,Test-f-h-V,150,2500i 150o 500s,0:0:0,0,0,0,0,0,\a\n"
+    "11,1/13/2026 4:39,9106,0,0,67,66,67,69,Test-f-h-V,150,2500i 150o 500s,0:0:0,0,11,6,0,0,\a\n"
+    "11,1/13/2026 4:40,7712,0,0,67,66,67,69,Test-f-h-V,150,2500i 150o 500s,0:0:0,0,11,6,0,0,\a\n"
+    "11,1/13/2026 4:41,2973,0,0,67,66,67,70,Test-f-h-V,150,2500i 150o 500s,0:0:0,0,11,6,0,0,\a\n"
+    "11,1/13/2026 4:42,1617,0,0,67,66,66,70,Test-f-h-V,150,1617i 150o 500s,0:0:0,0,11,6,0,0,\a\n"
+    "11,1/13/2026 4:43,1214,0,0,67,66,66,70,Test-f-h-V,150,1214i 150o 500s,0:0:0,0,11,6,0,0,\a\n"
+    "11,1/13/2026 4:44,1064,0,0,67,66,66,70,Test-f-h-V,150,1064i 150o 500s,0:0:0,0,22465,22460,"
+    "0,0,\a\n"
+    "11,1/13/2026 4:45,1006,0,0,67,66,66,70,Test-f-h-V,150F8";
+static const char REAL_BLOCK2[] =
+    "FDFILEBLOCK,42838.2026-01-13_04.37.csv,675,2,2723,t-F-h-V,150,519i 150o 500s,0:0:0,0,27371"
+    ",27366,0,0,\a\n"
+    "11,1/13/2026 4:57,501,0,0,66,66,66,79,Test-F-h-V,150,501i 150o 500s,0:0:0,0,27371,27366,0,"
+    "0,\a\n"
+    "11,1/13/2026 4:58,519,40,40,71,70,70,80,Test-F-H-V,150,519i 150o 500s,80:80:80,0,27371,273"
+    "66,0,0,\a\n"
+    "11,1/13/2026 4:59,560,60,60,84,83,81,80,Test-F-H-V,150,560i 150o 500s,80:80:80,0,27672,276"
+    "67,0,0,\a\n"
+    "11,1/13/2026 5:00,581,60,60,95,95,92,81,Test-F-H-V,150,581i 150o 500s,80:80:80,0,27672,276"
+    "67,0,0,\a\n"
+    "11,1/13/2026 5:01,1908,24,24,103,103,98,81,Test-f-h-v,150,1908i 150o 500s,0:0:0,0,27672,27"
+    "667,0,0, , , , , ,500,600,150,,Pump Off,\a\n"
+    "11,1/13/2026 5:02,26185,0,0,102,101,96,80,Test-f-h-v,150,2500i 150o 500s,0:0:0,0,27672,276"
+    "67,0,0,\a\n"
+    "31";
+
+/* Header and rows of 42838.2026-09-05_08.55.csv (276,530 bytes, 2,986 rows
+ * a minute apart). The first header column is the batch name; the verbose
+ * columns after Process are this firmware's (v6.5.0.644170). */
+static const char REAL_HDR[] =
+    "8DNEPNQAM,TStamp,mTorr,HtrReq,HtrOn,Top-J20,Mid-J17,Bot-J19,Room-J18,Process,"
+    "Master,TTT,HPP,mT~Hr,mT~Mid,LowF,v6.5.0.644170,SN=42838,HL/D,mT~50,HL/D/6,"
+    "TmTyp=B,500,600,120,-System Name-,Oil-Free Pump,EndPump:Off,HLG4SA325B7A04906,";
+static const char REAL_ROW_START[] =
+    "11,9/5/2026 8:55,60245,0,0,39,43,22,63,Startup,120,2500i 120o 500s,0:0:0,0,0,0,0,0,"
+    "10/,10/, , , ,500,600,120,Auto,Pump Off,";
+static const char REAL_ROW_DRY[] =
+    "11,9/6/2026 9:54,493,60,60,95,96,96,71,Drying-3Z,96,493i 96o 500s,20:17:30,0,2,1,95,96,";
+static const char REAL_ROW_END[] =
+    "11,9/7/2026 10:40,50758,0,0,-36,-38,-41,51,PreDefrost,150,2500i 150o 500s,0:0:0,0,306,14,-39,-39,";
+
+static void test_real_fixtures(void)
+{
+    hr_frame_t f;
+    hr_fdlist_entry_t e;
+    hr_fdblock_t b;
+
+    TEST_CASE("real FDFILELIST replies (capture 02-fdfiles)");
+    CHECK(hr_frame_parse("FDFILELIST,42838.2026-01-13_04.37.csv,0,2723", &f));
+    CHECK(hr_fdlist_parse(&f, &e));
+    CHECK_STR(e.name, "42838.2026-01-13_04.37.csv");
+    CHECK_INT(e.index, 0);
+    CHECK_INT(e.size, 2723);
+    CHECK(!e.end);
+    CHECK(hr_frame_parse("FDFILELIST,42838.2026-09-05_08.55.csv,4,276530", &f));
+    CHECK(hr_fdlist_parse(&f, &e));
+    CHECK_INT(e.size, 276530);
+
+    TEST_CASE("real FDFILEBLOCK 0: header order, BEL, checksum F8");
+    size_t l0 = sizeof(REAL_BLOCK0) - 1;
+    CHECK_INT(l0, 51 + 1024 + 2);
+    CHECK(hr_fdblock_parse(REAL_BLOCK0, l0, &b));
+    CHECK_STR(b.name, "42838.2026-01-13_04.37.csv");
+    CHECK_INT(b.nbytes, 1024);
+    CHECK_INT(b.block, 0);
+    CHECK_INT(b.size, 2723);
+    CHECK_INT(b.sum, 0xF8);
+    CHECK(b.sum_ok);
+    /* the file's first line starts with an EMPTY batch name */
+    CHECK(memcmp(b.data, ",TStamp,mTorr,", 14) == 0);
+    /* line ends arrive as BEL LF and go back to CR LF */
+    CHECK(memchr(b.data, '\r', 1024) == NULL);
+    char copy[1024];
+    memcpy(copy, b.data, 1024);
+    hr_fdblock_unbel(copy, 1024);
+    CHECK(memchr(copy, '\a', 1024) == NULL);
+    CHECK(strstr(REAL_BLOCK0, "150\a\n") == NULL); /* the wire had 150F8 */
+
+    TEST_CASE("real FDFILEBLOCK 2: short last block, checksum 31");
+    size_t l2 = sizeof(REAL_BLOCK2) - 1;
+    CHECK(hr_fdblock_parse(REAL_BLOCK2, l2, &b));
+    CHECK_INT(b.nbytes, 675);
+    CHECK_INT(b.block, 2);
+    CHECK_INT(b.size, 2723);
+    CHECK_INT(b.sum, 0x31);
+    CHECK(b.sum_ok);
+    CHECK(b.nbytes < HR_FDBLOCK_SIZE);   /* what ends a transfer */
+
+    TEST_CASE("real block through the stream, byte by byte");
+    {
+        static hr_session_t s;
+        static char big[HR_FILES_BIGBUF];
+        sink_t k;
+        memset(&k, 0, sizeof(k));
+        hr_session_init(&s, tx_drop, NULL);
+        hr_session_set_observer(&s, on_obs, &k);
+        hr_session_set_block_sink(&s, big, sizeof(big), on_block, &k);
+        feed_bytewise(&s, REAL_BLOCK0, l0, 100);
+        hr_session_rx(&s, "\r", 1, 101);
+        /* a real encoded STAT from the same machine follows the block */
+        const char *stat = ")S$;K43S_G/%4`K>ISDA0&9Bb):b[T``P8.K^G\\?,8[WNL:07D_U8QJEVN/I@ICbRVF/I1\\K1aU6=121$P)8H.Y!";
+        hr_session_rx(&s, stat, strlen(stat), 102);
+        CHECK_INT(k.blocks, 1);
+        CHECK_INT(k.last_len, l0);
+        CHECK_INT(k.frames, 1);
+        CHECK_STR(k.verbs[0], "STAT");
+        CHECK_INT(s.stream.frames_bad, 0);
+        CHECK_INT(s.stream.noise_bytes, 0);
+        CHECK_INT(s.unknown_verbs, 0);
+    }
+
+    TEST_CASE("real block through the state machine");
+    {
+        hr_files_t fs;
+        harness_t h;
+        setup(&fs, &h);
+        CHECK(hr_files_start_read(&fs, "42838.2026-01-13_04.37.csv", 2723, 100));
+        hr_files_tick(&fs, 101, true);
+        hr_files_on_block(&fs, REAL_BLOCK0, l0, 180);
+        CHECK_INT(h.sink_calls, 1);
+        CHECK_INT(fs.received, 1024);
+        CHECK_INT(fs.block, 1);
+        fs.block = 2; /* skip the middle block this fixture set lacks */
+        hr_files_tick(&fs, 200, true);
+        hr_files_on_block(&fs, REAL_BLOCK2, l2, 280);
+        CHECK_INT(h.sink_calls, 2);
+        CHECK(h.done_state == HR_FILES_DONE);
+    }
+
+    TEST_CASE("real CSV header: batch name first, Room-J18 at 8, 30 columns");
+    hr_csv_cols_t c;
+    CHECK(hr_csv_header_parse(REAL_HDR, &c));
+    CHECK_INT(c.ncols, 24);            /* capped at HR_CSV_COLS_MAX */
+    CHECK_INT(c.tstamp, 1);
+    CHECK_INT(c.mtorr, 2);
+    CHECK_INT(c.htrreq, 3);
+    CHECK_INT(c.htron, 4);
+    CHECK_INT(c.top, 5);
+    CHECK_INT(c.mid, 6);
+    CHECK_INT(c.bot, 7);
+    CHECK_INT(c.room, 8);
+    CHECK_INT(c.process, 9);
+
+    TEST_CASE("real CSV rows: start, drying, end");
+    char line[256];
+    hr_csv_row_t r;
+    strcpy(line, REAL_ROW_START);
+    CHECK(hr_csv_row_parse(line, &c, &r));
+    CHECK(r.have_time);
+    CHECK_INT(r.month, 9); CHECK_INT(r.day, 5); CHECK_INT(r.year, 2026);
+    CHECK_INT(r.hour, 8); CHECK_INT(r.minute, 55);
+    CHECK_INT(r.mtorr, 60245);          /* atmosphere, raw */
+    CHECK_INT(r.top_f, 39); CHECK_INT(r.mid_f, 43); CHECK_INT(r.bot_f, 22);
+    CHECK_INT(r.room_f, 63);
+    CHECK_STR(r.process, "Startup");
+    long t0 = hr_csv_row_minutes(&r);
+    strcpy(line, REAL_ROW_DRY);
+    CHECK(hr_csv_row_parse(line, &c, &r));
+    CHECK_INT(r.mtorr, 493);
+    CHECK_INT(r.htrreq, 60); CHECK_INT(r.htron, 60);
+    CHECK_INT(r.mid_f, 96); CHECK_INT(r.room_f, 71);
+    CHECK_STR(r.process, "Drying-3Z");
+    CHECK_INT(hr_csv_row_minutes(&r) - t0, 24 * 60 + 59);
+    strcpy(line, REAL_ROW_END);
+    CHECK(hr_csv_row_parse(line, &c, &r));
+    CHECK_INT(r.mid_f, -38); CHECK_INT(r.room_f, 51);
+    CHECK_STR(r.process, "PreDefrost");
+    CHECK_INT(hr_csv_row_minutes(&r) - t0, 2 * 24 * 60 + 105);
+
+    TEST_CASE("HRTempFC.txt: the panel's unit, as read");
+    /* FILEREAD HRTempFC.txt 0 -> FDFILEBLOCK,HRTempFC.txt,11,0,11,0,Celsius, XX */
+    const char *tempfc = "0,Celsius, ";
+    CHECK_INT(strlen(tempfc), 11);
+    CHECK(strstr(tempfc, "Celsius") != NULL);
+}
+
 int main(void)
 {
     test_fdlist_parse();
@@ -954,5 +1199,6 @@ int main(void)
     test_sm_read();
     test_sm_timeouts_and_link();
     test_csv();
+    test_real_fixtures();
     return TEST_REPORT();
 }

@@ -262,13 +262,13 @@ config HR_BATCH_HISTORY
         Adds GET/POST /api/dryer/files* and a "Batch history" page.
 
         Reads only: both verbs are in the SAFE allow-list and nothing here
-        can start, stop or change a run. Costs about 6 KB of static RAM
-        (block side buffer, one-block mailbox, list cache) and a few hundred
-        KB of the capture partition for cached copies.
+        can start, stop or change a run. Costs about 4 KB of static RAM
+        (block side buffer, list cache) plus 8 KB of heap while a file is
+        being read; files are streamed to the browser, nothing is stored.
 
-        The wire format is reconstructed from the 6.0.641041 firmware image
-        and has not yet been confirmed against a live machine, which is why
-        the runtime switch below defaults off.
+        Confirmed live 2026-09-17 on a 6.0.644170 machine (docs/30): list,
+        read, checksums, a 276 KB batch log in 55 s at ~5 KB/s with the
+        dryer's 15 s STAT cadence untouched.
 
 config HR_BATCH_HISTORY_DEFAULT_ON
     bool "Batch history: switched on at first boot"
@@ -278,8 +278,10 @@ config HR_BATCH_HISTORY_DEFAULT_ON
         Value of the runtime switch (Settings > Batch history, or POST
         /api/dryer/files/enable, kept in NVS) until the owner changes it.
         Off: the code is present but sends nothing to the dryer until the
-        switch is flipped, on a machine that is idle, after the protocol has
-        been confirmed live (docs/30 §7).
+        switch is flipped. The T-Dongle-S3 defaults turn it on; the generic
+        build stays off so an upstream cherry-pick changes nothing on the
+        wire by itself. Either way a read is refused while a batch runs
+        unless the request says force=1.
 
 config HR_HTTP_LOG_TO_UART
     bool "Also echo received frames to the UART console"

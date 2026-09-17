@@ -12,7 +12,7 @@
  *
  *     FDFILES <pattern> <index>        -> FDFILELIST,<name>,<index>,<size>\r
  *                                         FDFILELIST,NULL,<index>,0\r  past the end
- *     FILEREAD <name> <block>          -> FDFILEBLOCK,<name>,<block>,<nbytes>,<size>,<data...>XX\r
+ *     FILEREAD <name> <block>          -> FDFILEBLOCK,<name>,<nbytes>,<block>,<size>,<data...>XX\r
  *
  * FDFILES (executor 0x2b868 -> 0x20eb0 -> directory walk 0x20df8): walks the
  * root of the dryer's internal drive, skips names starting with '.', skips
@@ -26,14 +26,17 @@
  * 0x400 = 1024 bytes at offset <block>*1024 into 0x20006be0, replaces every
  * 0x0D in the data with 0x07 (BEL), sums the bytes mod 256, then sends
  *
- *     "FDFILEBLOCK,%s,%d,%d,%ld," (name, block, bytes read, file size)
+ *     "FDFILEBLOCK,%s,%d,%d,%ld," (name, BYTES READ, block, file size)
  *     + the raw bytes (CR -> BEL, LF kept, commas kept)
  *     + "%02X\r"                  (the sum, upper-case hex)
  *
  * A missing file gives "FDFILEBLOCK,,0,0,0,00". The last block is short
- * (bytes read < 1024) or empty. [high confidence for the shape, from the
- * disassembly; the author's live "A1" reply to FILEREAD is exactly this
- * trailer arriving after the data was shredded by a CR/LF line parser]
+ * (bytes read < 1024) or empty. CONFIRMED LIVE 2026-09-17 on 6.0.644170
+ * (docs/30): the block frame arrives in PLAINTEXT even on that firmware -
+ * only the dryer's formatted frames (STAT, FDFILELIST, ...) are encoded -
+ * and the field order is bytes-then-block; the author's live "A1" reply to
+ * FILEREAD was this trailer arriving after the data had been shredded by a
+ * CR/LF line parser.
  *
  * Because the data carries LF and BEL and can exceed HR_MAX_FRAME, the
  * ordinary line reassembler cannot carry a block: hr_stream_t grows a
@@ -97,7 +100,8 @@ typedef struct {
 
 /*
  * Is `buf` (the first `len` bytes of a plaintext line, no terminator) the
- * complete header of an FDFILEBLOCK frame?
+ * complete header of an FDFILEBLOCK frame ("FDFILEBLOCK,<name>,<nbytes>,
+ * <block>,<size>,")?
  *   > 0  header complete, this many bytes; *nbytes = declared data length
  *   0    could still become one; need more bytes
  *  -1    not an FDFILEBLOCK header (or one with impossible numbers)
@@ -162,7 +166,7 @@ typedef void (*hr_files_done_fn)(hr_files_state_t st, hr_files_err_t err,
 #define HR_FILES_TIMEOUT_MS   3000UL
 #define HR_FILES_RETRIES      3
 #define HR_FILES_LIST_MAX     64      /* entries we will ask for */
-#define HR_FILES_MAX_SIZE     (256L * 1024L)
+#define HR_FILES_MAX_SIZE     (512L * 1024L)
 
 typedef struct {
     hr_files_state_t state;
@@ -188,6 +192,15 @@ typedef struct {
     unsigned long timeout_ms;
     int max_retries;
     long max_size;
+    /*
+     * Send the next request from on_frame()/on_block()/resume() as soon as
+     * the reply is in, instead of waiting for the next tick(). Off by
+     * default (tick-paced, one request per caller tick); on, a transfer
+     * runs at the dryer's own reply latency (~70-100 ms a block, measured).
+     * The caller's send callback then runs on whichever task feeds the
+     * session - the same task that already answers REQINFO with WIFIINFO.
+     */
+    bool send_inline;
 
     hr_files_send_fn send;
     void *send_user;
