@@ -2982,9 +2982,17 @@ $$("#unitseg button").forEach(b=>b.addEventListener("click",()=>{
   unitChosen = b.dataset.unit;
   try{ localStorage.setItem("fh-unit", b.dataset.unit); }catch(e){ /* this visit only */ }
   repaintUnit();
-  if(screenPref==="auto") return;   /* the screen follows the dryer; leave it */
-  ctrlPost("/api/units", "temp_unit="+b.dataset.unit).then(paintScreenUnit)
-    .catch(()=>{ /* screen keeps its unit */ });
+  /* Mirror into the screen setting - unless the screen is on Auto (it follows
+     the dryer; leave it). If the screen's setting is not known yet (the first
+     /api/units is still in flight on a slow link), ask before overwriting. */
+  const mirror=()=>{
+    if(screenPref==="auto") return;
+    ctrlPost("/api/units", "temp_unit="+b.dataset.unit).then(paintScreenUnit)
+      .catch(()=>{ /* screen keeps its unit */ });
+  };
+  if(screenPref===null){
+    fetch("/api/units").then(r=>r.json()).then(j=>{ paintScreenUnit(j); mirror(); }).catch(()=>{});
+  }else mirror();
 }));
 $$("#screenseg button").forEach(b=>b.addEventListener("click",async()=>{
   const st=$("#unitstatus");
