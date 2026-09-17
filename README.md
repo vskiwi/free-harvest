@@ -582,6 +582,8 @@ visible in the browser and names the actual error.
 | Shows "Ready" during a real batch | Normal for ~30s after a reboot: it must observe the elapsed counter advance before claiming a run |
 | Page unreachable after Wi-Fi change | Its IP probably changed — check your router's client list |
 | Page unreachable, but the router still lists the adapter | Its IP lease lapsed while the Wi-Fi link stayed up. Give it a minute: it notices within seconds, restarts DHCP at 15 s and rejoins the network at 45 s, and keeps retrying for as long as it's powered. Afterwards, `noip_episodes` in `/api/state` counts how often it has happened |
+| Page unreachable, adapter shows "connected" with an address | On a weak signal the adapter can still hear the router while the router no longer hears it. It sends the router an ARP probe every 20 s; after three unanswered in a row the status becomes `unreachable` and it rejoins. `gw_dead_episodes` in `/api/state` counts these; `rssi_dbm` below about −85 means move the adapter or the router, or add a repeater |
+| Drops out for hours at a time | Look at `rssi_dbm`, `wifi_drops`, `wifi_join_fails` and `wifi_last_reason` in `/api/state`, and at the `wifi ...` lines in `/api/capture` (they survive for days; `/api/log` keeps minutes). Reason 200 = beacons lost, 201 = network not found on rejoin: the signal, not the firmware. Below −85 dBm a USB extension lead or a repeater is the fix |
 
 ---
 
