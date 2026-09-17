@@ -379,6 +379,12 @@ static void post_display_status(void)
          * 0.0.0.0 as if it were reachable. */
         s.wifi = HR_UI_WIFI_NO_IP;
         break;
+    case HR_WIFI_UNREACHABLE:
+        /* Address held, gateway silent (hr_netwatch.h): hr_wifi is
+         * rejoining. The address on the screen must read as a fault, not
+         * as "open this in a browser". */
+        s.wifi = HR_UI_WIFI_UNREACHABLE;
+        break;
     default:
         s.wifi = HR_UI_WIFI_NONE;
         break;

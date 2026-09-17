@@ -39,6 +39,10 @@ typedef enum {
      * granted); the adapter is restarting DHCP / rejoining by itself.
      * Not connected for every purpose the screen cares about. */
     HR_UI_WIFI_NO_IP,
+    /* Associated with an address, but the router has stopped answering the
+     * station (weak signal: it still hears the router, the router no longer
+     * hears it). The adapter is rejoining by itself. Not connected either. */
+    HR_UI_WIFI_UNREACHABLE,
 } hr_ui_wifi_t;
 
 /* Longest slice of the raw STAT body the RAW screen can show: 5 x 26. */

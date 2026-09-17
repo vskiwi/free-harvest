@@ -134,6 +134,34 @@ static void test_no_ip_then_regained(void)
     CHECK_INT(hr_ui_select(&st, &m, 113000), HR_UI_SCREEN_NO_DRYER);
 }
 
+static void test_unreachable_then_regained(void)
+{
+    TEST_CASE("UNREACHABLE does not block RUN; the link regained after it is shown");
+    hr_ui_model_t m;
+    hr_ui_state_t st;
+    fresh(&m, &st);
+    m.wifi = HR_UI_WIFI_CONNECTED;
+    dryer_running(&m, HR_PHASE_DRYING);
+    CHECK_INT(hr_ui_select(&st, &m, 100000), HR_UI_SCREEN_RUN);
+
+    /* The router stopped answering; the address is still held. Telemetry
+     * keeps the screen - the dryer is what matters here. */
+    m.wifi = HR_UI_WIFI_UNREACHABLE;
+    CHECK_INT(hr_ui_select(&st, &m, 101000), HR_UI_SCREEN_RUN);
+
+    /* Without a dryer: "waiting", not the connecting banner. */
+    fresh(&m, &st);
+    m.usb_mounted = true;
+    m.wifi = HR_UI_WIFI_UNREACHABLE;
+    CHECK_INT(hr_ui_select(&st, &m, 102000), HR_UI_SCREEN_NO_DRYER);
+
+    /* Rejoined (the address may have changed): show it for 10 s. */
+    m.wifi = HR_UI_WIFI_CONNECTED;
+    snprintf(m.ip, sizeof(m.ip), "192.168.1.78");
+    CHECK_INT(hr_ui_select(&st, &m, 103000), HR_UI_SCREEN_CONNECTING);
+    CHECK_INT(hr_ui_select(&st, &m, 113000), HR_UI_SCREEN_NO_DRYER);
+}
+
 static void test_alert_link_lost_and_dismiss(void)
 {
     TEST_CASE("link lost mid-batch raises ALERT; short press dismisses");
@@ -696,6 +724,7 @@ int main(void)
     test_provision_connecting_main();
     test_no_dryer_vs_run();
     test_no_ip_then_regained();
+    test_unreachable_then_regained();
     test_alert_link_lost_and_dismiss();
     test_alert_priority_and_kinds();
     test_info_raw_cycle_and_timeout();

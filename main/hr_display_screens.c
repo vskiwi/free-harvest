@@ -82,6 +82,7 @@ static void status_bar(const hr_ui_state_t *st, const hr_ui_model_t *m,
     /* Associated but no address: a fault, not a join in progress. Blink
      * so it reads differently from a plain connecting. */
     case HR_UI_WIFI_NO_IP:
+    case HR_UI_WIFI_UNREACHABLE:
         cw = blink(now_ms, 1000) ? HR_UI_C_RED : HR_UI_C_DKGREY;
         break;
     default:                    cw = HR_UI_C_GREY; break;
@@ -283,6 +284,18 @@ static void screen_connecting(const hr_ui_state_t *st, const hr_ui_model_t *m,
                        HR_UI_C_GREY, HR_UI_C_BLACK);
         hr_gfx_text6x8(X_MARGIN, Y_FOOT2, "retrying by itself",
                        HR_UI_C_GREY, HR_UI_C_BLACK);
+    } else if (m->wifi == HR_UI_WIFI_UNREACHABLE) {
+        /* The address is real but leads nowhere: the router stopped
+         * answering. Shown red, not as the address, so it is not read as
+         * "open this IP". */
+        hr_gfx_text6x8(X_MARGIN, Y_LINE2,
+                       blink(now_ms, 1000) ? "link dead - rejoining"
+                                           : "link dead",
+                       HR_UI_C_RED, HR_UI_C_BLACK);
+        hr_gfx_text6x8(X_MARGIN, Y_FOOT1, "router not answering",
+                       HR_UI_C_GREY, HR_UI_C_BLACK);
+        hr_gfx_text6x8(X_MARGIN, Y_FOOT2, "weak signal? rejoining",
+                       HR_UI_C_GREY, HR_UI_C_BLACK);
     } else {
         hr_gfx_text6x8(X_MARGIN, Y_LINE2,
                        blink(now_ms, 1000) ? "connecting..." : "connecting",
@@ -331,6 +344,9 @@ static void screen_no_dryer(const hr_ui_state_t *st, const hr_ui_model_t *m,
         hr_gfx_text6x8(X_MARGIN, Y_FOOT1, line, HR_UI_C_GREY, HR_UI_C_BLACK);
     } else if (m->wifi == HR_UI_WIFI_NO_IP) {
         hr_gfx_text6x8(X_MARGIN, Y_FOOT1, "Wi-Fi: no IP, reconnecting",
+                       HR_UI_C_RED, HR_UI_C_BLACK);
+    } else if (m->wifi == HR_UI_WIFI_UNREACHABLE) {
+        hr_gfx_text6x8(X_MARGIN, Y_FOOT1, "Wi-Fi: link dead, rejoining",
                        HR_UI_C_RED, HR_UI_C_BLACK);
     } else {
         hr_gfx_text6x8(X_MARGIN, Y_FOOT1, "no Wi-Fi", HR_UI_C_GREY,
@@ -560,6 +576,9 @@ static void screen_info(const hr_ui_state_t *st, const hr_ui_model_t *m,
     } else if (m->wifi == HR_UI_WIFI_NO_IP) {
         clip(m->ssid, 10, a, sizeof(a));
         snprintf(line, sizeof(line), "%s: no IP, rejoin", a);
+    } else if (m->wifi == HR_UI_WIFI_UNREACHABLE) {
+        clip(m->ssid, 8, a, sizeof(a));
+        snprintf(line, sizeof(line), "%s: link dead, rejoin", a);
     } else {
         snprintf(line, sizeof(line), "Wi-Fi: none");
     }
