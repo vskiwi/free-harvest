@@ -6,10 +6,13 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_net_stack.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "lwip/etharp.h"
+#include "lwip/netif.h"
 #include "lwip/sockets.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -41,6 +44,11 @@ static const char *TAG = "hr_wifi";
  */
 #define NOIP_POLL_US (2 * 1000000ULL)
 #define NOIP_GRACE_MS 5000u
+/*
+ * Gateway probe (hr_netwatch.h): an ARP request every CONFIG_HR_WIFI_GW_PROBE_S
+ * while an address is held, checked for an answer on the next 2 s poll.
+ */
+#define GW_PROBE_MS ((uint32_t)CONFIG_HR_WIFI_GW_PROBE_S * 1000u)
 /*
  * Link history. A join that fails is retried every 30 s for as long as the
  * network stays out of reach - 18 hours of that is 2000 identical lines, so
@@ -87,6 +95,8 @@ static uint32_t s_up_since_ms;    /* start of the current CONNECTED spell */
 static uint32_t s_down_since_ms;  /* when CONNECTED was last lost */
 static bool s_ever_up;            /* had a working link at least once */
 static uint32_t s_rssi_sample_ms; /* last RSSI record written to the capture */
+static uint32_t s_probe_sent_ms;  /* when the last gateway probe went out */
+static bool s_probe_pending;      /* sent, answer not yet looked for */
 
 /* -------------------------------------------------------------------- */
 /* NVS credential storage                                                */
@@ -202,6 +212,9 @@ static void cancel_sta_retry(void)
 /* -------------------------------------------------------------------- */
 /* No-IP watchdog                                                        */
 /* -------------------------------------------------------------------- */
+static void gw_probe_step(uint32_t now);
+static void request_rejoin(void);
+
 static uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
@@ -229,8 +242,84 @@ static const char *status_name(hr_wifi_status_t s)
     case HR_WIFI_CONNECTING: return "connecting";
     case HR_WIFI_CONNECTED: return "connected";
     case HR_WIFI_NO_IP: return "no-ip";
+    case HR_WIFI_UNREACHABLE: return "unreachable";
     default: return "booting";
     }
+}
+
+/*
+ * Gateway probe, both halves running on the lwIP thread via
+ * esp_netif_tcpip_exec() (the ARP table is that thread's).
+ *
+ * ARP rather than ICMP: a router may be told not to answer pings, but it
+ * cannot refuse to answer for its own address and still route anything.
+ * The catch is that lwIP's table keeps a learned entry for ARP_MAXAGE
+ * (minutes) whether or not the peer is still answering, so "is the gateway
+ * in the table" says nothing by itself. The probe therefore drops the
+ * station netif's entries first and asks; two seconds later the gateway is
+ * either back in the table (it answered, or asked for us - alive either
+ * way) or it is not. The cost is one extra ARP round-trip for each peer
+ * the station talks to, once per probe interval, and lwIP queues the packet
+ * meanwhile rather than dropping it.
+ */
+typedef struct {
+    struct netif *nif;
+    ip4_addr_t gw;
+    bool found;
+} gw_probe_t;
+
+static esp_err_t gw_probe_send_cb(void *arg)
+{
+    gw_probe_t *p = arg;
+    etharp_cleanup_netif(p->nif);
+    return etharp_request(p->nif, &p->gw) == ERR_OK ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t gw_probe_check_cb(void *arg)
+{
+    gw_probe_t *p = arg;
+    struct eth_addr *eth;
+    const ip4_addr_t *ip;
+    p->found = etharp_find_addr(p->nif, &p->gw, &eth, &ip) >= 0;
+    return ESP_OK;
+}
+
+/* The station netif and its gateway; false when there is nothing to probe. */
+static bool gw_probe_target(gw_probe_t *p)
+{
+    esp_netif_ip_info_t ip = {0};
+    if (s_sta_netif == NULL ||
+        esp_netif_get_ip_info(s_sta_netif, &ip) != ESP_OK ||
+        ip.ip.addr == 0 || ip.gw.addr == 0) {
+        return false;
+    }
+    p->nif = esp_netif_get_netif_impl(s_sta_netif);
+    p->gw.addr = ip.gw.addr;
+    p->found = false;
+    return p->nif != NULL;
+}
+
+/* Send a probe; true if one went out. */
+static bool gw_probe_send(void)
+{
+    gw_probe_t p;
+    if (!gw_probe_target(&p)) {
+        return false;
+    }
+    return esp_netif_tcpip_exec(gw_probe_send_cb, &p) == ESP_OK;
+}
+
+/* Was the probe answered? */
+static bool gw_probe_answered(void)
+{
+    gw_probe_t p;
+    if (!gw_probe_target(&p)) {
+        return false;
+    }
+    if (esp_netif_tcpip_exec(gw_probe_check_cb, &p) != ESP_OK) {
+        return false;
+    }
+    return p.found;
 }
 
 /*
@@ -287,10 +376,13 @@ static void noip_check(void)
             hr_capture_event("wifi rssi=%d up=%lus", ap_rssi(),
                              (unsigned long)((now - s_up_since_ms) / 1000u));
         }
+        gw_probe_step(now);
         return;
     }
+    s_probe_pending = false; /* whatever was in flight has no path now */
     if (hr_netwatch_no_ip(&s_netwatch, now) &&
-        (s_status == HR_WIFI_CONNECTED || s_status == HR_WIFI_CONNECTING)) {
+        (s_status == HR_WIFI_CONNECTED || s_status == HR_WIFI_CONNECTING ||
+         s_status == HR_WIFI_UNREACHABLE)) {
         ESP_LOGW(TAG, "associated with \"%s\" but no IP address for %lus "
                       "(DHCP not answering); reporting as not connected",
                  s_ssid, noip_s);
@@ -319,12 +411,7 @@ static void noip_check(void)
                                  1000u));
         hr_capture_event("wifi rejoin %u no-ip=%lus rssi=%d",
                          (unsigned)s_netwatch.reconnects, noip_s, ap_rssi());
-        s_noip_rejoin_pending = true;
-        err = esp_wifi_disconnect();
-        if (err != ESP_OK) {
-            s_noip_rejoin_pending = false;
-            ESP_LOGW(TAG, "esp_wifi_disconnect: %s", esp_err_to_name(err));
-        }
+        request_rejoin();
         break;
     default:
         break;
@@ -337,6 +424,66 @@ static void noip_poll_cb(void *arg)
     noip_check();
 }
 
+/* Leave and rejoin so the router sees the station afresh. Shared by the
+ * no-IP and the dead-link remedies; the disconnect handler recognises it. */
+static void request_rejoin(void)
+{
+    s_noip_rejoin_pending = true;
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK) {
+        s_noip_rejoin_pending = false;
+        ESP_LOGW(TAG, "esp_wifi_disconnect: %s", esp_err_to_name(err));
+    }
+}
+
+/*
+ * One step of the gateway probe, from the 2 s poll while an address is
+ * held: look for the answer to the probe sent last time, then send the next
+ * one when its interval is up. Off when CONFIG_HR_WIFI_GW_PROBE_S is 0.
+ */
+static void gw_probe_step(uint32_t now)
+{
+    if (GW_PROBE_MS == 0) {
+        return;
+    }
+    if (s_probe_pending) {
+        s_probe_pending = false;
+        bool ok = gw_probe_answered();
+        hr_netwatch_action_t act = hr_netwatch_on_probe(&s_netwatch, ok, now);
+        unsigned long dead_s =
+            (unsigned long)(hr_netwatch_dead_for_ms(&s_netwatch, now) / 1000u);
+        if (ok && s_status == HR_WIFI_UNREACHABLE) {
+            ESP_LOGW(TAG, "gateway answering again");
+            hr_capture_event("wifi gateway back rssi=%d", ap_rssi());
+            set_status(HR_WIFI_CONNECTED);
+        } else if (!ok && hr_netwatch_dead(&s_netwatch) &&
+                   s_status == HR_WIFI_CONNECTED) {
+            ESP_LOGW(TAG, "associated with \"%s\", address held, but the "
+                          "gateway has not answered %lu probes in a row; "
+                          "reporting as not connected",
+                     s_ssid, (unsigned long)s_netwatch.cfg.probe_miss_limit);
+            hr_capture_event("wifi unreachable rssi=%d up=%lus", ap_rssi(),
+                             (unsigned long)((now - s_up_since_ms) / 1000u));
+            set_status(HR_WIFI_UNREACHABLE);
+        }
+        if (act == HR_NETWATCH_RECONNECT) {
+            ESP_LOGW(TAG, "gateway silent: leaving and rejoining \"%s\" "
+                          "(rejoin %u, next after %lu misses)",
+                     s_ssid, (unsigned)s_netwatch.dead_reconnects,
+                     (unsigned long)hr_netwatch_probe_miss_limit(&s_netwatch));
+            hr_capture_event("wifi rejoin-dead %u dead=%lus rssi=%d",
+                             (unsigned)s_netwatch.dead_reconnects, dead_s,
+                             ap_rssi());
+            request_rejoin();
+            return;
+        }
+    }
+    if (now - s_probe_sent_ms >= GW_PROBE_MS && gw_probe_send()) {
+        s_probe_sent_ms = now;
+        s_probe_pending = true;
+    }
+}
+
 static void start_noip_poll(void)
 {
     hr_netwatch_cfg_t cfg = {
@@ -344,6 +491,7 @@ static void start_noip_poll(void)
         .dhcp_restart_ms = (uint32_t)CONFIG_HR_WIFI_NOIP_DHCP_RESTART_S * 1000u,
         .reconnect_ms = (uint32_t)CONFIG_HR_WIFI_NOIP_RECONNECT_S * 1000u,
         .reconnect_max_ms = (uint32_t)CONFIG_HR_WIFI_NOIP_RECONNECT_MAX_S * 1000u,
+        .probe_miss_limit = (uint32_t)CONFIG_HR_WIFI_GW_PROBE_MISSES,
     };
     hr_netwatch_init(&s_netwatch, &cfg);
     const esp_timer_create_args_t a = {.callback = noip_poll_cb,
@@ -521,6 +669,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         uint32_t now = now_ms();
         bool was_assoc = s_netwatch.associated;
         hr_netwatch_on_disassoc(&s_netwatch, now);
+        s_probe_pending = false;
         s_last_reason = d->reason;
         if (was_assoc) {
             s_link_drops++;
@@ -561,7 +710,8 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                 ESP_LOGW(TAG, "esp_wifi_connect: %s", esp_err_to_name(err));
                 arm_sta_retry();
             }
-        } else if (s_status == HR_WIFI_CONNECTED || s_status == HR_WIFI_NO_IP) {
+        } else if (s_status == HR_WIFI_CONNECTED || s_status == HR_WIFI_NO_IP ||
+                   s_status == HR_WIFI_UNREACHABLE) {
             /*
              * We had a working link and lost it (e.g. router/internet outage).
              * Reconnect, but DO NOT re-broadcast the setup AP if the one-time
@@ -811,7 +961,8 @@ hr_wifi_status_t hr_wifi_status(void)
 void hr_wifi_ip(char *out, size_t cap)
 {
     esp_netif_ip_info_t ip = {0};
-    if (s_status == HR_WIFI_CONNECTED || s_status == HR_WIFI_NO_IP) {
+    if (s_status == HR_WIFI_CONNECTED || s_status == HR_WIFI_NO_IP ||
+        s_status == HR_WIFI_UNREACHABLE) {
         /* The station's real address - 0.0.0.0 while it has none, which is
          * exactly what the status page should say then. */
         esp_netif_get_ip_info(s_sta_netif, &ip);
@@ -829,6 +980,10 @@ void hr_wifi_noip_stats(hr_wifi_noip_stats_t *out)
     out->episodes = (unsigned)s_netwatch.episodes;
     out->dhcp_restarts = (unsigned)s_netwatch.dhcp_restarts;
     out->reconnects = (unsigned)s_netwatch.reconnects;
+    out->dead_s = hr_netwatch_dead_for_ms(&s_netwatch, now) / 1000u;
+    out->probe_misses = (unsigned)s_netwatch.probe_misses;
+    out->dead_episodes = (unsigned)s_netwatch.dead_episodes;
+    out->dead_reconnects = (unsigned)s_netwatch.dead_reconnects;
 }
 
 void hr_wifi_link_stats(hr_wifi_link_stats_t *out)

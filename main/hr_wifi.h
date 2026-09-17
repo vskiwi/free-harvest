@@ -16,6 +16,12 @@
  *     seconds without one the status is HR_WIFI_NO_IP, DHCP is restarted,
  *     and if that does not help the network is left and rejoined, with
  *     back-off (hr_netwatch.h, CONFIG_HR_WIFI_NOIP_*).
+ *   - "Connected" also means the gateway answers. While an address is held
+ *     it is sent an ARP request every CONFIG_HR_WIFI_GW_PROBE_S; after
+ *     CONFIG_HR_WIFI_GW_PROBE_MISSES unanswered in a row the status is
+ *     HR_WIFI_UNREACHABLE and the network is rejoined - the case of a weak
+ *     signal where the station still hears the router but the router no
+ *     longer hears the station, which the driver never reports.
  */
 #ifndef HR_WIFI_H
 #define HR_WIFI_H
@@ -36,6 +42,15 @@ typedef enum {
      * treat this as NOT connected.
      */
     HR_WIFI_NO_IP,
+    /*
+     * Associated AND holding an address, but the gateway has not answered
+     * CONFIG_HR_WIFI_GW_PROBE_MISSES ARP probes in a row: the station hears
+     * the router's beacons while its own frames no longer get across (weak
+     * signal), or the router forgot it without saying so. Nothing is
+     * reachable. hr_wifi is rejoining (hr_netwatch.h); callers must treat
+     * this as NOT connected.
+     */
+    HR_WIFI_UNREACHABLE,
 } hr_wifi_status_t;
 
 void hr_wifi_start(void);
@@ -58,6 +73,13 @@ typedef struct {
     unsigned episodes;
     unsigned dhcp_restarts;
     unsigned reconnects;
+    /* The gateway probe (HR_WIFI_UNREACHABLE): seconds the link has counted
+     * as dead (0 = alive or not probing), unanswered probes in a row so far,
+     * and since boot the dead-link episodes and the rejoins they caused. */
+    unsigned long dead_s;
+    unsigned probe_misses;
+    unsigned dead_episodes;
+    unsigned dead_reconnects;
 } hr_wifi_noip_stats_t;
 
 void hr_wifi_noip_stats(hr_wifi_noip_stats_t *out);

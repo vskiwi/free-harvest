@@ -226,6 +226,179 @@ static void test_clock_wrap(void)
     CHECK(hr_netwatch_no_ip(&w, t));
 }
 
+/* Associate and get an address at t; the state a probe runs from. */
+static void join_with_ip(hr_netwatch_t *w, uint32_t *t)
+{
+    hr_netwatch_on_assoc(w, *t);
+    *t += 1000;
+    CHECK_INT(hr_netwatch_tick(w, true, *t), HR_NETWATCH_NONE);
+}
+
+static void test_probe_answered_is_quiet(void)
+{
+    TEST_CASE("a gateway that answers, with the odd miss, trips nothing");
+    hr_netwatch_t w;
+    hr_netwatch_init(&w, &CFG);
+    CHECK_INT(w.cfg.probe_miss_limit, 3);
+    uint32_t t = S(100);
+    join_with_ip(&w, &t);
+    for (int i = 0; i < 200; i++) {
+        t += S(20);
+        /* Every fifth probe lost: a weak link, not a dead one. */
+        bool ok = (i % 5) != 0;
+        CHECK_INT(hr_netwatch_on_probe(&w, ok, t), HR_NETWATCH_NONE);
+        CHECK(!hr_netwatch_dead(&w));
+    }
+    CHECK_INT(w.dead_episodes, 0);
+    CHECK_INT(w.dead_reconnects, 0);
+    CHECK_INT(hr_netwatch_dead_for_ms(&w, t), 0);
+    /* Two misses then an answer: the count starts over. */
+    t += S(20);
+    CHECK_INT(hr_netwatch_on_probe(&w, false, t), HR_NETWATCH_NONE);
+    t += S(20);
+    CHECK_INT(hr_netwatch_on_probe(&w, false, t), HR_NETWATCH_NONE);
+    CHECK_INT(w.probe_misses, 2);
+    t += S(20);
+    CHECK_INT(hr_netwatch_on_probe(&w, true, t), HR_NETWATCH_NONE);
+    CHECK_INT(w.probe_misses, 0);
+}
+
+static void test_dead_link_is_rejoined_after_the_limit(void)
+{
+    TEST_CASE("address held, gateway silent 3x in a row -> DEAD, rejoin");
+    hr_netwatch_t w;
+    hr_netwatch_init(&w, &CFG);
+    uint32_t t = S(10);
+    join_with_ip(&w, &t);
+
+    /* The station's frames stop getting across; beacons still arrive, the
+     * driver stays associated, the lease is valid. */
+    uint32_t silent = t + S(600);
+    t = silent;
+    CHECK_INT(hr_netwatch_on_probe(&w, false, t), HR_NETWATCH_NONE);
+    t += S(20);
+    CHECK_INT(hr_netwatch_on_probe(&w, false, t), HR_NETWATCH_NONE);
+    CHECK(!hr_netwatch_dead(&w)); /* two misses: not yet */
+    CHECK(!hr_netwatch_no_ip(&w, t)); /* and it is not a no-IP case */
+    t += S(20);
+    CHECK_INT(hr_netwatch_on_probe(&w, false, t), HR_NETWATCH_RECONNECT);
+    CHECK(hr_netwatch_dead(&w));
+    CHECK_INT(hr_netwatch_dead_for_ms(&w, t), 0); /* just declared */
+    CHECK_INT(w.dead_episodes, 1);
+    CHECK_INT(w.dead_reconnects, 1);
+    CHECK_INT(t - silent, S(40)); /* third probe at 40 s: bounded */
+    t += S(5);
+    CHECK_INT(hr_netwatch_dead_for_ms(&w, t), S(5));
+
+    /* The driver leaves; dead is a property of an association. */
+    hr_netwatch_on_disassoc(&w, t);
+    CHECK(!hr_netwatch_dead(&w));
+    CHECK_INT(hr_netwatch_dead_for_ms(&w, t), 0);
+
+    /* Rejoined, address back, gateway answers: clean slate. */
+    t += S(2);
+    join_with_ip(&w, &t);
+    t += S(20);
+    CHECK_INT(hr_netwatch_on_probe(&w, true, t), HR_NETWATCH_NONE);
+    CHECK(!hr_netwatch_dead(&w));
+    CHECK_INT(w.dead_backoff_n, 0);
+    CHECK_INT(hr_netwatch_probe_miss_limit(&w), 3);
+    CHECK_INT(w.dead_episodes, 1);
+    /* The no-IP counters were never involved. */
+    CHECK_INT(w.episodes, 0);
+    CHECK_INT(w.reconnects, 0);
+}
+
+static void test_dead_link_rejoins_back_off(void)
+{
+    TEST_CASE("rejoins that bring an address but no answer need 3,6,12,24,48,48 misses");
+    hr_netwatch_t w;
+    hr_netwatch_init(&w, &CFG);
+    uint32_t t = 0;
+    uint32_t expected_misses[] = {3, 6, 12, 24, 48, 48};
+    for (unsigned i = 0; i < 6; i++) {
+        join_with_ip(&w, &t);
+        CHECK_INT(hr_netwatch_probe_miss_limit(&w), expected_misses[i]);
+        unsigned misses = 0;
+        hr_netwatch_action_t a = HR_NETWATCH_NONE;
+        while (a == HR_NETWATCH_NONE && misses < 100) {
+            t += S(20);
+            misses++;
+            a = hr_netwatch_on_probe(&w, false, t);
+        }
+        CHECK_INT(a, HR_NETWATCH_RECONNECT);
+        CHECK_INT(misses, expected_misses[i]);
+        CHECK_INT(w.dead_reconnects, i + 1);
+        hr_netwatch_on_disassoc(&w, t);
+        t += S(2);
+    }
+    CHECK_INT(w.dead_episodes, 6);
+}
+
+static void test_dead_link_repeats_if_disconnect_never_comes(void)
+{
+    TEST_CASE("if the leave is not reported, ask again after more misses");
+    hr_netwatch_t w;
+    hr_netwatch_init(&w, &CFG);
+    uint32_t t = 0;
+    join_with_ip(&w, &t);
+    for (int i = 0; i < 3; i++) {
+        t += S(20);
+        hr_netwatch_on_probe(&w, false, t);
+    }
+    CHECK(hr_netwatch_dead(&w));
+    uint32_t declared = t;
+    /* No on_disassoc(). Still dead, still one episode; the next request
+     * comes after six more misses. */
+    unsigned misses = 0;
+    hr_netwatch_action_t a = HR_NETWATCH_NONE;
+    while (a == HR_NETWATCH_NONE && misses < 100) {
+        t += S(20);
+        misses++;
+        a = hr_netwatch_on_probe(&w, false, t);
+        CHECK(hr_netwatch_dead(&w));
+    }
+    CHECK_INT(a, HR_NETWATCH_RECONNECT);
+    CHECK_INT(misses, 6);
+    CHECK_INT(w.dead_episodes, 1);
+    CHECK_INT(w.dead_reconnects, 2);
+    CHECK_INT(hr_netwatch_dead_for_ms(&w, t), t - declared);
+}
+
+static void test_probe_without_address_is_ignored(void)
+{
+    TEST_CASE("misses while there is no address, or no association, count for nothing");
+    hr_netwatch_t w;
+    hr_netwatch_init(&w, &CFG);
+    uint32_t t = 0;
+    for (int i = 0; i < 10; i++) {
+        t += S(20);
+        CHECK_INT(hr_netwatch_on_probe(&w, false, t), HR_NETWATCH_NONE);
+    }
+    CHECK_INT(w.probe_misses, 0);
+    hr_netwatch_on_assoc(&w, t); /* associated, DHCP still running */
+    for (int i = 0; i < 10; i++) {
+        t += 1000;
+        CHECK_INT(hr_netwatch_on_probe(&w, false, t), HR_NETWATCH_NONE);
+    }
+    CHECK_INT(w.probe_misses, 0);
+    CHECK(!hr_netwatch_dead(&w));
+    /* Address arrives, then two misses, then the lease is lost: the no-IP
+     * path takes over and the miss count is dropped with it. */
+    hr_netwatch_tick(&w, true, t);
+    t += S(20);
+    hr_netwatch_on_probe(&w, false, t);
+    t += S(20);
+    hr_netwatch_on_probe(&w, false, t);
+    CHECK_INT(w.probe_misses, 2);
+    t += S(1);
+    hr_netwatch_tick(&w, false, t);
+    CHECK_INT(w.probe_misses, 0);
+    t += S(20);
+    CHECK_INT(hr_netwatch_on_probe(&w, false, t), HR_NETWATCH_NONE);
+    CHECK(!hr_netwatch_dead(&w));
+}
+
 int main(void)
 {
     test_defaults();
@@ -236,5 +409,10 @@ int main(void)
     test_reconnect_repeats_if_disconnect_never_comes();
     test_not_associated_is_never_no_ip();
     test_clock_wrap();
+    test_probe_answered_is_quiet();
+    test_dead_link_is_rejoined_after_the_limit();
+    test_dead_link_rejoins_back_off();
+    test_dead_link_repeats_if_disconnect_never_comes();
+    test_probe_without_address_is_ignored();
     return TEST_REPORT();
 }

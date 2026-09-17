@@ -10,6 +10,8 @@
 #define DEFAULT_RECONNECT_MS     (45u * 1000u)
 #define DEFAULT_RECONNECT_MAX_MS (6u * 60u * 1000u)
 #define BACKOFF_SHIFT_CAP        10u /* 2^10 x base is already past any cap */
+#define DEFAULT_PROBE_MISS_LIMIT 3u
+#define DEAD_BACKOFF_SHIFT_CAP   4u  /* misses needed grow up to 16x */
 
 void hr_netwatch_init(hr_netwatch_t *w, const hr_netwatch_cfg_t *cfg)
 {
@@ -31,6 +33,15 @@ void hr_netwatch_init(hr_netwatch_t *w, const hr_netwatch_cfg_t *cfg)
                                       ? w->cfg.reconnect_ms
                                       : DEFAULT_RECONNECT_MAX_MS;
     }
+    if (w->cfg.probe_miss_limit == 0) {
+        w->cfg.probe_miss_limit = DEFAULT_PROBE_MISS_LIMIT;
+    }
+}
+
+static void clear_dead(hr_netwatch_t *w)
+{
+    w->probe_misses = 0;
+    w->dead = false;
 }
 
 static void begin_episode(hr_netwatch_t *w, uint32_t now_ms)
@@ -64,6 +75,9 @@ void hr_netwatch_on_disassoc(hr_netwatch_t *w, uint32_t now_ms)
     w->associated = false;
     w->have_ip = false;
     end_episode(w);
+    /* Not associated is a different state from "associated and silent";
+     * the dead-link back-off count survives until a probe is answered. */
+    clear_dead(w);
 }
 
 uint32_t hr_netwatch_reconnect_delay_ms(const hr_netwatch_t *w)
@@ -90,6 +104,8 @@ hr_netwatch_action_t hr_netwatch_tick(hr_netwatch_t *w, bool have_ip,
         return HR_NETWATCH_NONE;
     }
     w->have_ip = false;
+    /* The address went; the no-IP remedies take over from the probe. */
+    clear_dead(w);
     if (!w->in_episode) {
         begin_episode(w, now_ms);
     }
@@ -145,4 +161,58 @@ uint32_t hr_netwatch_noip_for_ms(const hr_netwatch_t *w, uint32_t now_ms)
         return 0;
     }
     return now_ms - w->noip_since_ms;
+}
+
+uint32_t hr_netwatch_probe_miss_limit(const hr_netwatch_t *w)
+{
+    uint32_t n = w->dead_backoff_n < DEAD_BACKOFF_SHIFT_CAP
+                     ? w->dead_backoff_n
+                     : DEAD_BACKOFF_SHIFT_CAP;
+    return w->cfg.probe_miss_limit << n;
+}
+
+hr_netwatch_action_t hr_netwatch_on_probe(hr_netwatch_t *w, bool answered,
+                                          uint32_t now_ms)
+{
+    if (!w->associated || !w->have_ip) {
+        /* Nothing to probe through; a stale result is not evidence. */
+        return HR_NETWATCH_NONE;
+    }
+    if (answered) {
+        /* The network is there. Whatever the rejoins cost, start clean. */
+        clear_dead(w);
+        w->dead_backoff_n = 0;
+        return HR_NETWATCH_NONE;
+    }
+    w->probe_misses++;
+    if (w->probe_misses < hr_netwatch_probe_miss_limit(w)) {
+        return HR_NETWATCH_NONE;
+    }
+    /*
+     * Enough silence. The address is fine and the association is fine as
+     * far as the driver knows, so nothing short of leaving and rejoining
+     * makes the router look at this station afresh. Ask once per limit
+     * reached; the misses needed double while the answers stay away, so a
+     * router that is really gone is not rejoined every minute for hours.
+     */
+    if (!w->dead) {
+        w->dead = true;
+        w->dead_since_ms = now_ms;
+        w->dead_episodes++;
+    }
+    w->probe_misses = 0;
+    w->dead_reconnects++;
+    w->dead_backoff_n++;
+    w->last_action_ms = now_ms;
+    return HR_NETWATCH_RECONNECT;
+}
+
+bool hr_netwatch_dead(const hr_netwatch_t *w)
+{
+    return w->associated && w->have_ip && w->dead;
+}
+
+uint32_t hr_netwatch_dead_for_ms(const hr_netwatch_t *w, uint32_t now_ms)
+{
+    return hr_netwatch_dead(w) ? now_ms - w->dead_since_ms : 0;
 }
