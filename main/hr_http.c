@@ -3217,6 +3217,7 @@ static esp_err_t h_df_get(httpd_req_t *req)
     }
     const bool json = (strcmp(fmt, "json") == 0);
 
+    const unsigned long t0 = (unsigned long)(esp_timer_get_time() / 1000);
     hr_df_result_t r = hr_dryerfiles_fetch(name, force[0] == '1');
     ESP_LOGI(TAG, "dryer files: read %s (%s) -> %s", name,
              json ? "json" : "csv", hr_df_result_str(r));
@@ -3257,7 +3258,6 @@ static esp_err_t h_df_get(httpd_req_t *req)
 
     bool done = false;
     hr_files_err_t err = HR_FILES_ERR_NONE;
-    const unsigned long t0 = (unsigned long)(esp_timer_get_time() / 1000);
     unsigned long idle_since = t0;
     unsigned long total = 0;
     while (!done) {

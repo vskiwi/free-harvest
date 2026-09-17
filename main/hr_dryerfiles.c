@@ -210,16 +210,23 @@ static void cb_done(hr_files_state_t st, hr_files_err_t err, void *u)
         s_chunk.ended = true;
         s_chunk.err = (st == HR_FILES_DONE) ? HR_FILES_ERR_NONE : err;
     }
-    ESP_LOGI(TAG, "transfer %s%s%s: %ld bytes in %lu ms (%lu requests, "
-                  "%lu blocks, %lu bad, %lu timeouts; first req %lu ms, "
-                  "dryer %lu ms, paused for consumer %lu ms, depth %d)",
-             hr_files_state_str(st), err ? ": " : "", hr_files_err_str(err),
-             s_fs.received, now_ms() - s_fs.started_ms, s_fs.requests,
-             s_fs.blocks_ok, s_fs.blocks_bad, s_fs.timeouts, s_fs.t_first_ms,
-             s_fs.t_dryer_ms, s_fs.t_paused_ms, s_fs.depth);
-    hr_capture_event("files %s %s %s %ld B %lu ms first=%lu dryer=%lu "
+    const bool listing = (s_fs.name[0] == '\0');
+    ESP_LOGI(TAG, "%s %s%s%s: %s%ld in %lu ms (%lu requests, %lu blocks, "
+                  "%lu bad, %lu timeouts; first req %lu ms, dryer %lu ms, "
+                  "paused for consumer %lu ms, depth %d)",
+             listing ? "listing" : "transfer", hr_files_state_str(st),
+             err ? ": " : "", hr_files_err_str(err),
+             listing ? "entries " : "bytes ",
+             listing ? (long)s_fs.entries : s_fs.received,
+             now_ms() - s_fs.started_ms, s_fs.requests, s_fs.blocks_ok,
+             s_fs.blocks_bad, s_fs.timeouts, s_fs.t_first_ms, s_fs.t_dryer_ms,
+             s_fs.t_paused_ms, s_fs.depth);
+    hr_capture_event("files %s %s %s %ld %s %lu ms first=%lu dryer=%lu "
                      "paused=%lu depth=%d", hr_files_state_str(st),
-                     hr_files_err_str(err), s_fs.name, s_fs.received,
+                     hr_files_err_str(err),
+                     listing ? s_fs.pattern : s_fs.name,
+                     listing ? (long)s_fs.entries : s_fs.received,
+                     listing ? "entries" : "B",
                      now_ms() - s_fs.started_ms, s_fs.t_first_ms,
                      s_fs.t_dryer_ms, s_fs.t_paused_ms, s_fs.depth);
 }

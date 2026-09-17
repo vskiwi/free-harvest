@@ -3500,8 +3500,7 @@ const DF_PHASE_COLORS=[
   [/^drying/i,               "#d29922"],
   [/^finaldry/i,             "#f0883e"],
   [/^finished/i,             "#3fb950"],
-  [/defrost/i,               "#f85149"],
-  [/^test/i,                 "#bc8cff"]];
+  [/defrost/i,               "#f85149"]];
 const DF_FALLBACK=["#c98bff","#79c0ff","#ffa657","#7ee787","#ff7b72"];
 function dfPhaseColor(name, idx){
   for(const [re,c] of DF_PHASE_COLORS) if(re.test(name)) return c;
@@ -3684,10 +3683,10 @@ function dfDraw(d){
     ? " \u00b7 room "+fmtTU(Math.min(...roomVals))+"–"+fmtTU(Math.max(...roomVals))+
       (lastRoom!==undefined?" (last "+fmtTU(lastRoom)+")":"")
     : " \u00b7 no room column";
+  const ms=v=>v>=1000?(v/1000).toFixed(1)+" s":Math.round(v)+" ms";
   const tmTxt = d.timing && d.timing.elapsed_ms
-    ? " \u00b7 read in "+(d.timing.elapsed_ms/1000).toFixed(1)+" s (dryer "+
-      (d.timing.dryer_ms/1000).toFixed(1)+" s for "+d.timing.blocks+" blocks, Wi-Fi "+
-      (d.timing.socket_ms/1000).toFixed(1)+" s)"
+    ? " \u00b7 read in "+ms(d.timing.elapsed_ms)+" (the dryer took "+ms(d.timing.dryer_ms)+
+      " for "+d.timing.blocks+" blocks, Wi-Fi writes "+ms(d.timing.socket_ms)+")"
     : "";
   $("#df-note").textContent=fmtDur(totalS)+" of data, "+n+" rows, "+phases.length+" phase"+
     (phases.length===1?"":"s")+roomTxt+

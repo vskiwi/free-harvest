@@ -91,6 +91,10 @@ CONFIG_HR_LOG_RING_KB=24
 # the first boot on this board - confirmed live 2026-09-17 (docs/30). Reads
 # still refuse to run during a batch unless asked with force=1.
 CONFIG_HR_BATCH_HISTORY_DEFAULT_ON=y
+# Two FILEREADs in flight: measured live on 6.0.644170 (docs/30 §7.2) as
+# ~16 % faster than strict request-reply with no lost or duplicated blocks;
+# three was slower again. Overridable at runtime (POST /api/dryer/files/tune).
+CONFIG_HR_FILES_PIPELINE_DEPTH=2
 
 # --- Console: UART0 only, no USB-Serial/JTAG secondary (see above).
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
