@@ -1,5 +1,6 @@
 #include "hr_wifi.h"
 
+#include "hr_capture.h"
 #include "hr_netwatch.h"
 
 #include "esp_event.h"
@@ -40,6 +41,15 @@ static const char *TAG = "hr_wifi";
  */
 #define NOIP_POLL_US (2 * 1000000ULL)
 #define NOIP_GRACE_MS 5000u
+/*
+ * Link history. A join that fails is retried every 30 s for as long as the
+ * network stays out of reach - 18 hours of that is 2000 identical lines, so
+ * failed attempts go into the capture only this often after the first few.
+ * The signal is sampled into the capture at this interval while connected,
+ * so a weak spot can be read off afterwards instead of guessed at.
+ */
+#define JOIN_FAIL_RECORD_EVERY 10u
+#define RSSI_SAMPLE_MS (5u * 60u * 1000u)
 
 static hr_wifi_status_t s_status;
 static esp_netif_t *s_sta_netif;
@@ -59,6 +69,24 @@ static volatile bool s_noip_rejoin_pending;
 static wifi_ap_record_t s_scan[MAX_SCAN];
 static uint16_t s_scan_count;
 static volatile bool s_scanning;
+
+/*
+ * Link history since boot (hr_wifi_link_stats). The 32 KB log ring holds a
+ * few minutes of a busy link; an outage found the next morning has scrolled
+ * out of it. These counters, and the "wifi ..." event records hr_wifi writes
+ * into the capture (which lives in flash and spans days), are what is left
+ * to read then.
+ */
+static unsigned s_link_joins;     /* WIFI_EVENT_STA_CONNECTED */
+static unsigned s_link_drops;     /* STA_DISCONNECTED while associated */
+static unsigned s_join_fails;     /* STA_DISCONNECTED while not associated */
+static unsigned s_bcn_timeouts;   /* WIFI_EVENT_STA_BEACON_TIMEOUT */
+static int s_last_reason;         /* wifi_err_reason_t of the last drop/fail */
+static uint32_t s_assoc_since_ms; /* start of the current association */
+static uint32_t s_up_since_ms;    /* start of the current CONNECTED spell */
+static uint32_t s_down_since_ms;  /* when CONNECTED was last lost */
+static bool s_ever_up;            /* had a working link at least once */
+static uint32_t s_rssi_sample_ms; /* last RSSI record written to the capture */
 
 /* -------------------------------------------------------------------- */
 /* NVS credential storage                                                */
@@ -187,6 +215,44 @@ static bool sta_has_ip(void)
            ip.ip.addr != 0;
 }
 
+/* The driver's RSSI for the current association, 0 when there is none. */
+static int ap_rssi(void)
+{
+    wifi_ap_record_t ap;
+    return esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
+}
+
+static const char *status_name(hr_wifi_status_t s)
+{
+    switch (s) {
+    case HR_WIFI_AP_SETUP: return "setup-ap";
+    case HR_WIFI_CONNECTING: return "connecting";
+    case HR_WIFI_CONNECTED: return "connected";
+    case HR_WIFI_NO_IP: return "no-ip";
+    default: return "booting";
+    }
+}
+
+/*
+ * Every status change goes through here so the up/down clocks in
+ * hr_wifi_link_stats() cannot drift from what the rest of the firmware is
+ * told. CONNECTED is the only state in which anything is reachable.
+ */
+static void set_status(hr_wifi_status_t s)
+{
+    if (s == s_status) {
+        return;
+    }
+    uint32_t now = now_ms();
+    if (s == HR_WIFI_CONNECTED) {
+        s_up_since_ms = now;
+        s_ever_up = true;
+    } else if (s_status == HR_WIFI_CONNECTED) {
+        s_down_since_ms = now;
+    }
+    s_status = s;
+}
+
 /*
  * One pass of the watchdog: read the station's address, let hr_netwatch
  * decide, carry out what it asks. Runs from the poll timer (esp_timer task)
@@ -213,7 +279,13 @@ static void noip_check(void)
         if (s_status == HR_WIFI_NO_IP) {
             /* The GOT_IP event normally does this; cover the race where the
              * poll flipped the status just as the address arrived. */
-            s_status = HR_WIFI_CONNECTED;
+            set_status(HR_WIFI_CONNECTED);
+        }
+        if (s_status == HR_WIFI_CONNECTED &&
+            now - s_rssi_sample_ms >= RSSI_SAMPLE_MS) {
+            s_rssi_sample_ms = now;
+            hr_capture_event("wifi rssi=%d up=%lus", ap_rssi(),
+                             (unsigned long)((now - s_up_since_ms) / 1000u));
         }
         return;
     }
@@ -222,13 +294,15 @@ static void noip_check(void)
         ESP_LOGW(TAG, "associated with \"%s\" but no IP address for %lus "
                       "(DHCP not answering); reporting as not connected",
                  s_ssid, noip_s);
-        s_status = HR_WIFI_NO_IP;
+        hr_capture_event("wifi no-ip %lus rssi=%d", noip_s, ap_rssi());
+        set_status(HR_WIFI_NO_IP);
     }
 
     esp_err_t err;
     switch (act) {
     case HR_NETWATCH_DHCP_RESTART:
         ESP_LOGW(TAG, "no IP for %lus: restarting the DHCP client", noip_s);
+        hr_capture_event("wifi dhcp-restart no-ip=%lus", noip_s);
         /* "Already stopped" is fine here; the start is what matters. */
         esp_netif_dhcpc_stop(s_sta_netif);
         err = esp_netif_dhcpc_start(s_sta_netif);
@@ -243,6 +317,8 @@ static void noip_check(void)
                  noip_s, s_ssid, (unsigned)s_netwatch.reconnects,
                  (unsigned long)(hr_netwatch_reconnect_delay_ms(&s_netwatch) /
                                  1000u));
+        hr_capture_event("wifi rejoin %u no-ip=%lus rssi=%d",
+                         (unsigned)s_netwatch.reconnects, noip_s, ap_rssi());
         s_noip_rejoin_pending = true;
         err = esp_wifi_disconnect();
         if (err != ESP_OK) {
@@ -315,12 +391,12 @@ static void start_ap_mode(void)
          * Stay STA-only and keep retrying stored credentials. */
         ESP_LOGW(TAG, "setup AP not re-opened (window used); STA-only. "
                       "Reboot to run setup again.");
-        s_status = HR_WIFI_CONNECTING;
+        set_status(HR_WIFI_CONNECTING);
         esp_wifi_set_mode(WIFI_MODE_STA);
         return;
     }
     ESP_LOGI(TAG, "setup AP \"%s\" active (open for 5 min)", CONFIG_HR_AP_SSID);
-    s_status = HR_WIFI_AP_SETUP;
+    set_status(HR_WIFI_AP_SETUP);
     configure_ap();
     arm_ap_timeout();
     /* WiFi is already started by hr_wifi_start(); nothing else to do. */
@@ -361,7 +437,7 @@ static bool start_sta_connect(const char *ssid, const char *pw)
                  esp_err_to_name(err));
         return false;
     }
-    s_status = HR_WIFI_CONNECTING;
+    set_status(HR_WIFI_CONNECTING);
     snprintf(s_ssid, sizeof(s_ssid), "%s", ssid);
     err = esp_wifi_connect();
     if (err != ESP_OK) {
@@ -412,8 +488,28 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
          * timer is for a station that is NOT associated - if one is pending
          * it must not fire esp_wifi_connect() into a live association.
          */
+        wifi_event_sta_connected_t *c = (wifi_event_sta_connected_t *)data;
+        uint32_t now = now_ms();
         cancel_sta_retry();
-        hr_netwatch_on_assoc(&s_netwatch, now_ms());
+        hr_netwatch_on_assoc(&s_netwatch, now);
+        s_link_joins++;
+        s_assoc_since_ms = now;
+        hr_capture_event("wifi joined \"%.*s\" ch=%u rssi=%d %s=%lus",
+                         (int)c->ssid_len, (const char *)c->ssid,
+                         (unsigned)c->channel, ap_rssi(),
+                         s_ever_up ? "down" : "boot",
+                         (unsigned long)((now - (s_ever_up ? s_down_since_ms
+                                                           : 0u)) / 1000u));
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_BEACON_TIMEOUT) {
+        /*
+         * The driver has missed the AP's beacons for its inactive time (6 s)
+         * and is about to give up on the association (reason 200 follows).
+         * Weak or interfered signal looks exactly like this; counted so a
+         * marginal spot can be told from a router that went away.
+         */
+        s_bcn_timeouts++;
+        hr_capture_event("wifi beacon-timeout rssi=%d assoc=%lus", ap_rssi(),
+                         (unsigned long)((now_ms() - s_assoc_since_ms) / 1000u));
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         /*
          * Runs in the WiFi event task - MUST NOT block. Reconnect immediately
@@ -422,7 +518,31 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
          * out. After many failures we stop hammering but stay in APSTA.
          */
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
-        hr_netwatch_on_disassoc(&s_netwatch, now_ms());
+        uint32_t now = now_ms();
+        bool was_assoc = s_netwatch.associated;
+        hr_netwatch_on_disassoc(&s_netwatch, now);
+        s_last_reason = d->reason;
+        if (was_assoc) {
+            s_link_drops++;
+            hr_capture_event("wifi lost reason=%u rssi=%d assoc=%lus was=%s",
+                             (unsigned)d->reason, (int)d->rssi,
+                             (unsigned long)((now - s_assoc_since_ms) / 1000u),
+                             status_name(s_status));
+        } else {
+            /* A join that did not get as far as an association: the network
+             * is out of reach (201), or auth/handshake failed. Retried every
+             * 30 s, so thinned after the first few. */
+            s_join_fails++;
+            if (s_join_fails <= STA_RETRY_LIMIT ||
+                s_join_fails % JOIN_FAIL_RECORD_EVERY == 0) {
+                hr_capture_event("wifi join-failed reason=%u rssi=%d n=%u %s=%lus",
+                                 (unsigned)d->reason, (int)d->rssi,
+                                 s_join_fails, s_ever_up ? "down" : "boot",
+                                 (unsigned long)((now - (s_ever_up
+                                                             ? s_down_since_ms
+                                                             : 0u)) / 1000u));
+            }
+        }
         if (s_noip_rejoin_pending) {
             /*
              * The disconnect the no-IP watchdog asked for. Not a lost link:
@@ -435,7 +555,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             s_noip_rejoin_pending = false;
             ESP_LOGW(TAG, "left \"%s\" (reason %d) to re-run DHCP; rejoining",
                      s_ssid, d->reason);
-            s_status = HR_WIFI_CONNECTING;
+            set_status(HR_WIFI_CONNECTING);
             esp_err_t err = esp_wifi_connect();
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "esp_wifi_connect: %s", esp_err_to_name(err));
@@ -458,12 +578,23 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                 ESP_LOGW(TAG, "link dropped (reason %d), reconnecting STA-only "
                               "(setup AP window used)", d->reason);
             }
-            s_status = HR_WIFI_CONNECTING;
-            esp_wifi_connect();
+            set_status(HR_WIFI_CONNECTING);
+            /*
+             * The result comes back as STA_CONNECTED or another
+             * STA_DISCONNECTED (which retries); a refusal here would leave
+             * the station waiting for neither, so it gets the slow timer.
+             */
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "esp_wifi_connect: %s", esp_err_to_name(err));
+                arm_sta_retry();
+            }
         } else if (++s_sta_retries < STA_RETRY_LIMIT) {
             ESP_LOGW(TAG, "join attempt %d failed (reason %d), retrying",
                      s_sta_retries, d->reason);
-            esp_wifi_connect();
+            if (esp_wifi_connect() != ESP_OK) {
+                arm_sta_retry();
+            }
         } else {
             /*
              * The fast retries are spent. This used to stop here for good:
@@ -482,25 +613,30 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                          s_sta_retries, d->reason,
                          (unsigned)(STA_RETRY_BACKOFF_US / 1000000ULL));
             }
-            s_status = s_ap_window_expired ? HR_WIFI_CONNECTING
-                                           : HR_WIFI_AP_SETUP;
+            set_status(s_ap_window_expired ? HR_WIFI_CONNECTING
+                                           : HR_WIFI_AP_SETUP);
             arm_sta_retry();
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         /* Also raised on every lease renewal (ip_changed=false) and when
          * DHCP recovers after a no-IP episode: idempotent by design. */
+        uint32_t now = now_ms();
+        unsigned long noip_s =
+            (unsigned long)(hr_netwatch_noip_for_ms(&s_netwatch, now) / 1000u);
         if (s_status == HR_WIFI_NO_IP) {
             ESP_LOGW(TAG, "IP address back after %lus without one: " IPSTR,
-                     (unsigned long)(hr_netwatch_noip_for_ms(&s_netwatch,
-                                                             now_ms()) /
-                                     1000u),
-                     IP2STR(&e->ip_info.ip));
+                     noip_s, IP2STR(&e->ip_info.ip));
+            hr_capture_event("wifi ip " IPSTR " back after no-ip=%lus",
+                             IP2STR(&e->ip_info.ip), noip_s);
         } else if (s_status != HR_WIFI_CONNECTED || e->ip_changed) {
             ESP_LOGI(TAG, "connected, ip " IPSTR, IP2STR(&e->ip_info.ip));
+            hr_capture_event("wifi ip " IPSTR " gw " IPSTR " dhcp=%lus rssi=%d",
+                             IP2STR(&e->ip_info.ip), IP2STR(&e->ip_info.gw),
+                             noip_s, ap_rssi());
         }
-        hr_netwatch_tick(&s_netwatch, true, now_ms());
-        s_status = HR_WIFI_CONNECTED;
+        hr_netwatch_tick(&s_netwatch, true, now);
+        set_status(HR_WIFI_CONNECTED);
         s_sta_retries = 0;
         cancel_sta_retry();
         cancel_ap_timeout(); /* connected in time; no need to force-close AP */
@@ -525,6 +661,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
          * its braces, and the one line in the log that names the cause.
          */
         ESP_LOGW(TAG, "IP address lost (DHCP lease not renewed)");
+        hr_capture_event("wifi ip lost (lease not renewed)");
         noip_check();
     }
     /* Scan results are collected synchronously in hr_wifi_scan_start(); no
@@ -692,6 +829,22 @@ void hr_wifi_noip_stats(hr_wifi_noip_stats_t *out)
     out->episodes = (unsigned)s_netwatch.episodes;
     out->dhcp_restarts = (unsigned)s_netwatch.dhcp_restarts;
     out->reconnects = (unsigned)s_netwatch.reconnects;
+}
+
+void hr_wifi_link_stats(hr_wifi_link_stats_t *out)
+{
+    uint32_t now = now_ms();
+    out->joins = s_link_joins;
+    out->drops = s_link_drops;
+    out->join_fails = s_join_fails;
+    out->bcn_timeouts = s_bcn_timeouts;
+    out->last_reason = s_last_reason;
+    out->rssi_dbm = s_netwatch.associated ? ap_rssi() : 0;
+    out->assoc_s = s_netwatch.associated ? (now - s_assoc_since_ms) / 1000u : 0;
+    out->up_s = s_status == HR_WIFI_CONNECTED ? (now - s_up_since_ms) / 1000u : 0;
+    out->down_s = (s_status != HR_WIFI_CONNECTED && s_ever_up)
+                      ? (now - s_down_since_ms) / 1000u
+                      : 0;
 }
 
 /*
