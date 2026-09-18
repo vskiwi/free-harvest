@@ -84,6 +84,25 @@ bool hr_temp_pref_parse(const char *s, hr_temp_pref_t *out);
  */
 size_t hr_temp_fmt_num(long f, hr_temp_unit_t unit, char *out, size_t cap);
 
+/*
+ * HRTempFC.txt - the unit the dryer's OWN panel is set to.
+ *
+ * The dryer keeps that choice in a small data-flash record it hands over
+ * like any other file (FILEREAD HRTempFC.txt 0, see hr_files.h). Read live
+ * on 6.0.644170:
+ *
+ *     "0,Celsius, "        (11 bytes, panel set to degrees C)
+ *
+ * so the record is "<flag>,<Fahrenheit|Celsius>, ". The word is what this
+ * parser trusts - it is unambiguous - and the flag only breaks a tie when
+ * the word is missing (0 = Celsius as observed; 1 is then Fahrenheit). An
+ * empty data-flash record comes back as the dryer's stale transmit buffer
+ * ("FDFILEBLOCK,HR..."), which is rejected. `data` is the file's contents
+ * as delivered (line ends, BEL and NULs tolerated at either end).
+ * Returns HR_TEMP_F, HR_TEMP_C (as ints) or HR_TEMP_DRYER_UNKNOWN.
+ */
+int hr_tempfc_parse(const char *data, size_t n);
+
 #ifdef __cplusplus
 }
 #endif

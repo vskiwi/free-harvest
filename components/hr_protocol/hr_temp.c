@@ -118,3 +118,64 @@ size_t hr_temp_fmt_num(long f, hr_temp_unit_t unit, char *out, size_t cap)
     }
     return (size_t)n;
 }
+
+/* Case-insensitive whole-word search: `word` bounded by non-letters. */
+static bool has_word_ci(const char *s, size_t n, const char *word)
+{
+    const size_t wl = strlen(word);
+    for (size_t i = 0; i + wl <= n; i++) {
+        if (i > 0 && isalpha((unsigned char)s[i - 1])) {
+            continue;
+        }
+        if (i + wl < n && isalpha((unsigned char)s[i + wl])) {
+            continue;
+        }
+        size_t k = 0;
+        while (k < wl &&
+               tolower((unsigned char)s[i + k]) == (unsigned char)word[k]) {
+            k++;
+        }
+        if (k == wl) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int hr_tempfc_parse(const char *data, size_t n)
+{
+    if (data == NULL) {
+        return HR_TEMP_DRYER_UNKNOWN;
+    }
+    /* trim whitespace, NULs and the dryer's line ends at both ends */
+    while (n > 0 && ((unsigned char)data[0] <= 0x20)) {
+        data++;
+        n--;
+    }
+    while (n > 0 && ((unsigned char)data[n - 1] <= 0x20)) {
+        n--;
+    }
+    if (n == 0 || n > 64) {
+        return HR_TEMP_DRYER_UNKNOWN;
+    }
+    /* an empty data-flash record echoes the dryer's transmit buffer */
+    if (n >= 11 && memcmp(data, "FDFILEBLOCK", 11) == 0) {
+        return HR_TEMP_DRYER_UNKNOWN;
+    }
+    const bool c = has_word_ci(data, n, "celsius");
+    const bool f = has_word_ci(data, n, "fahrenheit");
+    if (c && !f) {
+        return HR_TEMP_C;
+    }
+    if (f && !c) {
+        return HR_TEMP_F;
+    }
+    if (c && f) {
+        return HR_TEMP_DRYER_UNKNOWN; /* both words: not the record we know */
+    }
+    /* No word: fall back to the flag, "<0|1>," - 0 was Celsius live. */
+    if (n >= 2 && data[1] == ',' && (data[0] == '0' || data[0] == '1')) {
+        return data[0] == '0' ? HR_TEMP_C : HR_TEMP_F;
+    }
+    return HR_TEMP_DRYER_UNKNOWN;
+}

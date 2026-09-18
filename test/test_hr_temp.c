@@ -5,6 +5,8 @@
 #include "hr_temp.h"
 #include "test_util.h"
 
+#include <string.h>
+
 int main(void)
 {
     TEST_CASE("F -> tenths of C, rounded half away from zero");
@@ -101,6 +103,32 @@ int main(void)
     CHECK_STR(hr_temp_pref_str(HR_TEMP_PREF_AUTO), "auto");
     CHECK_STR(hr_temp_unit_letter(HR_TEMP_F), "F");
     CHECK_STR(hr_temp_unit_letter(HR_TEMP_C), "C");
+
+    TEST_CASE("HRTempFC.txt parser: the live record");
+    CHECK_INT(hr_tempfc_parse("0,Celsius, ", 11), HR_TEMP_C);
+    CHECK_INT(hr_tempfc_parse("1,Fahrenheit, ", 14), HR_TEMP_F);
+    TEST_CASE("HRTempFC.txt parser: the word wins, spelling/case/ends tolerated");
+    CHECK_INT(hr_tempfc_parse("1,Celsius,", 10), HR_TEMP_C);
+    CHECK_INT(hr_tempfc_parse("0,FAHRENHEIT", 12), HR_TEMP_F);
+    CHECK_INT(hr_tempfc_parse("Celsius\r\n", 9), HR_TEMP_C);
+    CHECK_INT(hr_tempfc_parse("  0,Celsius, \a\r\n", 17), HR_TEMP_C);
+    TEST_CASE("HRTempFC.txt parser: flag alone, 0 = Celsius as seen live");
+    CHECK_INT(hr_tempfc_parse("0,", 2), HR_TEMP_C);
+    CHECK_INT(hr_tempfc_parse("1,", 2), HR_TEMP_F);
+    TEST_CASE("HRTempFC.txt parser: rejects");
+    CHECK_INT(hr_tempfc_parse("FDFILEBLOCK,HRShelves.tx", 24),
+              HR_TEMP_DRYER_UNKNOWN);
+    CHECK_INT(hr_tempfc_parse("", 0), HR_TEMP_DRYER_UNKNOWN);
+    CHECK_INT(hr_tempfc_parse(NULL, 5), HR_TEMP_DRYER_UNKNOWN);
+    CHECK_INT(hr_tempfc_parse("On,1,80,[-],0,1,0,1,1,0,", 24),
+              HR_TEMP_DRYER_UNKNOWN);
+    CHECK_INT(hr_tempfc_parse("2,", 2), HR_TEMP_DRYER_UNKNOWN);
+    CHECK_INT(hr_tempfc_parse("Celsius Fahrenheit", 18), HR_TEMP_DRYER_UNKNOWN);
+    {
+        char big[80];
+        memset(big, 'x', sizeof(big));
+        CHECK_INT(hr_tempfc_parse(big, sizeof(big)), HR_TEMP_DRYER_UNKNOWN);
+    }
 
     return TEST_REPORT();
 }
