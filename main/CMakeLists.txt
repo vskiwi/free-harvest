@@ -4,6 +4,9 @@ set(srcs "main.c" "hr_usb.c" "hr_wifi.c" "hr_http.c" "hr_mqtt.c"
 # Reading the dryer's own batch logs - see hr_dryerfiles.h.
 if(CONFIG_HR_BATCH_HISTORY)
     list(APPEND srcs "hr_dryerfiles.c")
+    # Not in upstream: the adapter screen's "auto" unit follows the dryer's
+    # panel, read through the file client above - see hr_unitsync.h.
+    list(APPEND srcs "hr_unitsync.c")
 endif()
 
 # Board peripherals (T-Dongle-S3). The sources are only compiled when the

@@ -15,6 +15,7 @@
 #include "sdkconfig.h"
 #if CONFIG_HR_BATCH_HISTORY
 #include "hr_dryerfiles.h"
+#include "hr_unitsync.h"   /* not in upstream: the screen's "auto" unit */
 #endif
 
 #include "esp_app_desc.h"
@@ -432,6 +433,27 @@ static esp_err_t h_state(httpd_req_t *req)
      * would not fit rather than half-written. */
     n += hr_dryerfiles_state_json(body + n, sizeof(body) - (size_t)n);
 #endif
+    /* Not in upstream: the adapter's screen unit (hr_units) and the dryer's
+     * own panel unit as last read from HRTempFC.txt (hr_unitsync); the
+     * page's unit is its own. Bounded; skipped if it does not fit. */
+    {
+        int du = hr_units_dryer_unit();
+        int u = snprintf(body + n, sizeof(body) - (size_t)n,
+                         "\"screen_unit\":\"%s\",\"screen_pref\":\"%s\","
+                         "\"dryer_unit\":%s%s%s,\"dryer_unit_synced_at\":%lu,"
+                         "\"dryer_unit_age_s\":%ld,\"dryer_unit_source\":\"%s\",",
+                         hr_temp_unit_letter(hr_units_temp()),
+                         hr_temp_pref_str(hr_units_pref()),
+                         du == HR_TEMP_DRYER_UNKNOWN ? "" : "\"",
+                         du == HR_TEMP_C ? "C" : du == HR_TEMP_F ? "F" : "null",
+                         du == HR_TEMP_DRYER_UNKNOWN ? "" : "\"",
+                         (unsigned long)hr_units_dryer_unit_epoch(),
+                         hr_units_dryer_unit_age_s(),
+                         hr_units_dryer_unit_source());
+        if (u > 0 && (size_t)u < sizeof(body) - (size_t)n) {
+            n += u;
+        }
+    }
     size_t room = sizeof(body) - (size_t)n;
     /* Raw frame: the config screens carry the live recipe in fields we do not
      * decode here, and the editor seeds itself from what is on the panel
@@ -1471,32 +1493,56 @@ static esp_err_t h_compat_post(httpd_req_t *req)
 }
 
 /*
- * GET  /api/units                  -> {"temp_unit":"F","temp_pref":"f"}
- * POST /api/units  temp_unit=f|c   (also accepts "fahrenheit"/"celsius",
- *                                   "imperial"/"metric", "auto")
+ * NOT IN UPSTREAM (the adapter's own screen; upstream keeps the unit in the
+ * browser only).
+ *
+ * GET  /api/units  -> {"temp_unit":"C","temp_pref":"auto","dryer_unit":"C",
+ *                      "dryer_unit_age_s":12,"dryer_unit_synced_at":0,
+ *                      "dryer_unit_source":"live"}
+ * POST /api/units  temp_unit=f|c|auto   (also "fahrenheit"/"celsius",
+ *                                        "imperial"/"metric")
+ * POST /api/units/sync                  read the dryer's panel unit now
+ *
+ * temp_unit  - what the SCREEN shows right now (AUTO resolved): "F" / "C"
+ * temp_pref  - the stored preference: "f" / "c" / "auto"
+ * dryer_unit - the dryer's own panel unit from HRTempFC.txt (hr_unitsync),
+ *              "F" / "C" / null; dryer_unit_age_s since it was read this
+ *              boot (-1: restored from NVS or never), dryer_unit_source
+ *              "live" / "nvs" / "none"; dryer_unit_synced_at epoch or 0.
  *
  * The temperature unit the ADAPTER's own display spells temperatures in (the
  * T-Dongle-S3 screen). Stored in NVS. The web page keeps its own per-browser
- * unit (Settings > Temperature unit, localStorage) and mirrors a change here
- * so the screen follows; /api/state and MQTT stay in the dryer's degrees F,
- * as upstream serves them. The dryer is not involved - it sends F regardless
- * and is told nothing - so this is a pure presentation setting and carries
- * the same PIN gate as the other adapter settings, no more.
+ * unit (Settings > Temperature unit, localStorage) and mirrors an explicit
+ * choice here so the screen follows; /api/state and MQTT stay in the dryer's
+ * degrees F, as upstream serves them. Setting the unit tells the dryer
+ * nothing; the sync is a read (one FILEREAD). Same PIN gate as the other
+ * adapter settings.
  */
 static size_t units_json(char *out, size_t cap, bool ok, bool stored)
 {
-    return (size_t)snprintf(out, cap,
-                            "{\"ok\":%s,\"temp_unit\":\"%s\","
-                            "\"temp_pref\":\"%s\",\"stored\":%s}",
-                            ok ? "true" : "false",
-                            hr_temp_unit_letter(hr_units_temp()),
-                            hr_temp_pref_str(hr_units_pref()),
-                            stored ? "true" : "false");
+    int du = hr_units_dryer_unit();
+    int n = snprintf(out, cap,
+                     "{\"ok\":%s,\"temp_unit\":\"%s\","
+                     "\"temp_pref\":\"%s\",\"stored\":%s,"
+                     "\"dryer_unit\":%s%s%s,\"dryer_unit_age_s\":%ld,"
+                     "\"dryer_unit_synced_at\":%lu,"
+                     "\"dryer_unit_source\":\"%s\"}",
+                     ok ? "true" : "false",
+                     hr_temp_unit_letter(hr_units_temp()),
+                     hr_temp_pref_str(hr_units_pref()),
+                     stored ? "true" : "false",
+                     du == HR_TEMP_DRYER_UNKNOWN ? "" : "\"",
+                     du == HR_TEMP_C ? "C" : du == HR_TEMP_F ? "F" : "null",
+                     du == HR_TEMP_DRYER_UNKNOWN ? "" : "\"",
+                     hr_units_dryer_unit_age_s(),
+                     (unsigned long)hr_units_dryer_unit_epoch(),
+                     hr_units_dryer_unit_source());
+    return (n < 0 || (size_t)n >= cap) ? 0 : (size_t)n;
 }
 
 static esp_err_t h_units_get(httpd_req_t *req)
 {
-    char out[96];
+    char out[256];
     size_t n = units_json(out, sizeof(out), true, true);
     return send_json(req, out, n);
 }
@@ -1518,20 +1564,71 @@ static esp_err_t h_units_post(httpd_req_t *req)
         httpd_query_key_value(buf, "units", v, sizeof(v)) != ESP_OK) {
         httpd_resp_set_status(req, "400 Bad Request");
         return httpd_resp_sendstr(
-            req, "{\"ok\":false,\"reason\":\"temp_unit=f|c required\"}");
+            req, "{\"ok\":false,\"reason\":\"temp_unit=f|c|auto required\"}");
     }
     hr_temp_pref_t pref;
     if (!hr_temp_pref_parse(v, &pref)) {
         httpd_resp_set_status(req, "400 Bad Request");
         return httpd_resp_sendstr(
-            req, "{\"ok\":false,\"reason\":\"temp_unit must be f or c\"}");
+            req, "{\"ok\":false,\"reason\":\"temp_unit must be f, c or auto\"}");
     }
     bool stored = hr_units_set_pref(pref);
 
-    char out[96];
+    char out[256];
     size_t n = units_json(out, sizeof(out), true, stored);
     return send_json(req, out, n);
 }
+
+#if CONFIG_HR_BATCH_HISTORY
+/*
+ * POST /api/units/sync - read the dryer's panel unit NOW (one FILEREAD of
+ * HRTempFC.txt through upstream's file client) and answer with the result
+ * once it is in, or after 3 s with "synced":false (the read still completes
+ * in the background and /api/units shows it). PIN-gated: it speaks to the
+ * dryer. 409 while the file client is busy with the page's own transfer.
+ */
+static esp_err_t h_units_sync(httpd_req_t *req)
+{
+    if (!pin_guard_small(req)) {
+        return ESP_OK;
+    }
+    long age_before = hr_units_dryer_unit_age_s();
+    hr_df_result_t r = hr_unitsync_now();
+    if (r != HR_DF_OK) {
+        char out[160];
+        httpd_resp_set_status(req, r == HR_DF_BUSY ? "409 Conflict"
+                                                    : "400 Bad Request");
+        int n = snprintf(out, sizeof(out), "{\"ok\":false,\"reason\":\"%s\","
+                                           "\"code\":%d}", hr_df_result_str(r),
+                         (int)r);
+        return send_json(req, out, (size_t)n);
+    }
+    bool synced = false;
+    for (int i = 0; i < 150; i++) {          /* 150 x 20 ms = 3 s */
+        vTaskDelay(pdMS_TO_TICKS(20));
+        hr_unitsync_tick(true);              /* drain and apply from here */
+        long age = hr_units_dryer_unit_age_s();
+        if (age >= 0 && (age_before < 0 || age < age_before)) {
+            synced = true;
+            break;
+        }
+        if (!hr_unitsync_busy()) {
+            break;                            /* finished without a value */
+        }
+    }
+    char out[256];
+    size_t n = units_json(out, sizeof(out), true, true);
+    /* splice "synced" in before the closing brace */
+    if (n > 1 && n + 24 < sizeof(out)) {
+        n--;
+        n += (size_t)snprintf(out + n, sizeof(out) - n, ",\"synced\":%s}",
+                              synced ? "true" : "false");
+    }
+    ESP_LOGI(TAG, "units: manual panel-unit sync -> %s",
+             synced ? "ok" : "no reply in time");
+    return send_json(req, out, n);
+}
+#endif
 
 /*
  * POST /api/dryer/reboot   body: confirm=REBOOT
@@ -3207,6 +3304,9 @@ void hr_http_start(hr_session_t *session, hr_history_t *history)
     reg("/api/compat", HTTP_POST, h_compat_post);
     reg("/api/units", HTTP_GET, h_units_get);
     reg("/api/units", HTTP_POST, h_units_post);
+#if CONFIG_HR_BATCH_HISTORY
+    reg("/api/units/sync", HTTP_POST, h_units_sync);
+#endif
     reg("/api/dryer/reboot", HTTP_POST, h_dryer_reboot);
     reg("/img/*", HTTP_GET, h_img);
     /* Captive-portal probes (Android/Apple/Windows). */
